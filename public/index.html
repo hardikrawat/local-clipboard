@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Clipboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔗 Local Clipboard</h1>
+            <p class="subtitle">Share text and files across your devices</p>
+        </header>
+
+        <div class="actions">
+            <button id="clearAll" class="btn btn-danger">Clear All</button>
+            <div class="connection-status" id="connectionStatus">
+                <span class="dot"></span>
+                <span class="status-text">Connected</span>
+            </div>
+        </div>
+
+        <div class="input-section">
+            <div class="text-input">
+                <textarea id="textInput" placeholder="Paste or type text here..." rows="4"></textarea>
+                <button id="addText" class="btn btn-primary">Add Text</button>
+            </div>
+            
+            <div class="file-input">
+                <input type="file" id="fileInput" multiple>
+                <button id="uploadFile" class="btn btn-secondary">Upload Files</button>
+            </div>
+        </div>
+
+        <div class="clipboard-content">
+            <div class="section">
+                <h2>📝 Text Clipboard</h2>
+                <div id="textList" class="item-list"></div>
+            </div>
+
+            <div class="section">
+                <h2>📁 File Clipboard</h2>
+                <div id="fileList" class="item-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
