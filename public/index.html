@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,19 +8,35 @@
     <link rel="stylesheet" href="styles.css">
     <script src="/socket.io/socket.io.js"></script>
 </head>
+
 <body>
     <div class="container">
         <header>
             <h1>🔗 Local Clipboard</h1>
             <p class="subtitle">Share text and files across your devices</p>
         </header>
-
+        <div class="auth-info">
+            <span class="auth-status">🔐 Authenticated</span>
+            <form method="POST" action="/logout" style="display: inline;">
+                <button type="submit" class="btn-logout">🚪 Logout</button>
+            </form>
+        </div>
         <div class="actions">
             <button id="clearAll" class="btn btn-danger">Clear All</button>
             <div class="connection-status" id="connectionStatus">
                 <span class="dot"></span>
                 <span class="status-text">Connected</span>
+                <button id="toggleClients" class="btn-small btn-info" style="margin-left: 10px;">Show Clients</button>
             </div>
+        </div>
+
+        <!-- Connected Clients Panel -->
+        <div id="clientsPanel" class="clients-panel" style="display: none;">
+            <div class="clients-header">
+                <h3>👥 Connected Clients</h3>
+                <button id="closeClients" class="btn-close">×</button>
+            </div>
+            <div id="clientsList" class="clients-list"></div>
         </div>
 
         <div class="input-section">
@@ -27,7 +44,7 @@
                 <textarea id="textInput" placeholder="Paste or type text here..." rows="4"></textarea>
                 <button id="addText" class="btn btn-primary">Add Text</button>
             </div>
-            
+
             <div class="file-input">
                 <input type="file" id="fileInput" multiple>
                 <button id="uploadFile" class="btn btn-secondary">Upload Files</button>
@@ -49,4 +66,5 @@
 
     <script src="app.js"></script>
 </body>
+
 </html>

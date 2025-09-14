@@ -1,0 +1,4832 @@
+<?php
+
+namespace App\Jobs;
+
+use App\Models\Order\Order;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+
+abstract class BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    public function __construct() {}
+
+    abstract public function handle(): void;
+
+    public function dispatchNextJob($payload): void
+    {
+        $order = Order::where('adid', $payload["orderId"])->first();
+        if (!$order) {
+            var_dump("Order not found for Adid: " . $payload["orderId"]);
+            return;
+        }
+
+        $workflowConfig = $order
+            ->productDefinition
+            ->workflow_config;
+
+        if ($workflowConfig && array_key_exists(static::class, $workflowConfig)) {
+            $jobConfig = $workflowConfig[static::class];
+            if ($jobConfig && isset($jobConfig['nextJob']) && $jobConfig['nextJob']) {
+                $jobConfig['nextJob']::dispatch($payload);
+            }
+        }
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Repositories\V4\order\OrderRepository;
+use App\Repositories\V4\Order\ReportRepository;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Throwable;
+use App\Models\Master\SourceSystem;
+
+/**
+ * Data Integrity Check job handler.
+ */
+class DataIntegrityCheckJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    protected $payload;
+
+    protected $sourceSystemId;
+
+    protected $orderId;
+
+    protected OrderRepository $orderRepository;
+
+    protected EventService $eventService;
+
+    protected ReportRepository $reportRepository;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_CHECK_DATA_INTEGRITY';
+
+    const EVENT_UDID = 'WIP_INTCHKP_MPDD_DI';
+
+    const JOB_VERSION = 4;
+
+    /**
+     * Create a new job instance.
+     */
+    public function __construct($payload)
+    {
+        $this->payload = $payload;
+        $this->orderRepository = app(OrderRepository::class);
+        $this->eventService = app(EventService::class);
+        $this->reportRepository = app(ReportRepository::class);
+    }
+
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $this->orderId = $this->payload['orderId'];
+
+            $inboundApiRequestId = $this->payload['apiRequestId'];
+            $jobId = (int) $this->job->getJobId();
+            $testCode = $this->payload['orderedTest'];
+            
+            $order = $this->orderRepository->getOrder($this->orderId);
+            $this->sourceSystemId = $this->orderRepository->getOrderSourceSystemId($this->orderId);
+
+            $sourceSystem = SourceSystem::find($this->sourceSystemId);
+
+            $failureReasons = [];
+
+            $event = $this->eventService->storeOrderEvent(
+                $order,
+                self::EVENT_UDID,
+                $sourceSystem->udid,
+                $inboundApiRequestId,
+                $jobId,
+                0,
+                $testCode
+            );
+
+            $checkPartialReportIsGenerated = $this->reportRepository->checkReportStatus($this->orderId, 'PRELIM');
+            if (!$checkPartialReportIsGenerated) {
+                $failureReasons[] = 'Partial report is not generated yet for the linked profile order.';
+            }
+
+            if(!empty($failureReasons)){
+                $this->eventService->setConditioCode($order, $event->order_event_id, 'MDICFL');
+                $this->eventService->setConditioCode($order, $event->order_event_id, 'WIPH');
+
+                $this->orderRepository->addCommentsToEvents([
+                    'order_event_id' => $event->order_event_id,
+                    'systemComment' => 'Data Integrity Check failed: '.implode(', ', $failureReasons),
+                    'systemCommentTime' => Carbon::now(),
+
+                ]);
+            } else {
+                $this->eventService->setConditioCode($order, $event->order_event_id, 'MDICOK');
+                $orderJobSpawner = app(OrderJobSpawnerV4::class);
+                $orderJobSpawner->spawn(get_class($this), [
+                    'orderId' => $this->orderId,
+                    'data' => [
+                       'orderId' => $this->orderId,
+                       'apiRequestId' => $inboundApiRequestId,
+                       'eventUdid' => self::EVENT_UDID,
+                       'reportAmendedWithTNPT' => false,
+                       'correctedValues' => [],
+                       'rptStatusUdid' => null,
+                       'orderedTest' => $testCode,
+                       'conditionCode' => $this->payload['conditionCode'],
+                       'data' => $this->payload,
+                    ],
+                ]);
+            }
+            DB::commit();
+        } catch (Throwable $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT
+            );
+
+            $this->fail($customException);
+        }
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Jobs\Parser\Interfaces\HL7\MessageBuilder;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use App\Jobs\BaseWorkflowJob;
+
+class FinalizeOrderJob extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    /**
+     * Create a new job instance.
+     */
+    public function __construct(private $payload)
+    {
+        $this->payload = $payload;
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        $items = $this->payload['items'] ?? null;
+
+        if (empty($items)) {
+            return;
+        }
+
+        $hl7 = (new MessageBuilder())->init();
+        $segment = $hl7->createSegment('PID');
+        $segment->append($hl7->createField());
+        $segment->append($hl7->createFieldValue(1));
+        $hl7->addSegment($segment);
+
+        foreach ($items as $number => $obr) {
+            $segment = $hl7->createSegment('OBR');
+            $segment->append($hl7->createFieldValue($number));
+            $testObr = "MK000012A|UNE.20241002.MK000012A|%13128^HAYSTACK MRD(TM) PERSONALIZATION^99QDI|R||20231207090000+0000|||||||||6206272012^Kazmierczak^Lawanda^^^^^^NPI||||||||Z3E|P||||||||||||||||||||||N";
+            foreach (explode('|', $testObr) as $seg) {
+                $segment->append($hl7->createFieldValue($seg));
+            }
+            $hl7->addSegment($segment);
+
+            foreach ($obr["obx"] as $number => $obx) {
+                $segment = $hl7->createSegment('OBX');
+                $segment->append($hl7->createFieldValue($number));
+                $segment->append($hl7->createFieldValue($obx['perfSiteAddRegion']));
+                $segment->append($hl7->createFieldValue($obx['ssMasOffSRCId']));
+                $segment->append($hl7->createField());
+                $segment->append($hl7->createFieldValue($obx['resValue']));
+
+                $hl7->addSegment($segment);
+            }
+        }
+
+        $this->dispatchNextJob($this->payload);
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Http\Services\V4\OrderService;
+use App\Models\Order\Order;
+use App\Models\Order\OrderEvent;
+use App\QWorker\JobModel\Queue\JobModel;
+use App\QWorker\JobModel\Request\Request;
+use App\QWorker\JobModel\System\SourceSystemModel;
+use App\QWorker\JobModel\System\SystemInterfaceModel;
+use App\QWorker\Order\Order as QWorkerOrder;
+use App\Repositories\V4\Order\OrderConditionRepository;
+use App\Repositories\V4\Order\OrderResultRepository;
+use Carbon\Carbon;
+use Exception;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+use Throwable;
+
+class Hl7DeliveryJobV4 implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected SystemInterfaceModel $interfaceModel;
+
+    protected Order $order;
+
+    protected OrderService $orderService;
+
+    protected EventService $eventService;
+
+    protected OrderResultRepository $orderRepository;
+
+    protected QWorkerOrder $qWorkerOrder;
+
+    protected SourceSystemModel $systemModel;
+
+    protected JobModel $jobModel;
+
+    protected OrderConditionRepository $orderConditionRepository;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_RESULT_PUBLISH';
+
+    const HL7_INTERFACE_UDID_ID = 'UNE_ORU_M8Q_HL7v2.3_v2';
+
+    public function __construct($payload = [])
+    {
+        $this->payload = $payload;
+        $this->qWorkerOrder = app(QWorkerOrder::class);
+        $this->orderService = app(OrderService::class);
+        $this->eventService = app(EventService::class);
+        $this->interfaceModel = app(SystemInterfaceModel::class);
+        $this->jobModel = app(JobModel::class);
+        $this->orderConditionRepository = app(OrderConditionRepository::class);
+        $this->orderRepository = app(OrderResultRepository::class);
+        $this->systemModel = app(SourceSystemModel::class);
+    }
+
+    public function handle()
+    {
+        try {
+            DB::beginTransaction();
+            $orderId = $this->job->getOrderId();
+            $this->order = $this->orderService->getOrderById($orderId);
+
+            $eventUdid = 'OUT_ORD_RESUPLD';
+            $inboundApiRequestId = $this->payload['apiRequestId'];
+            $testCodes = $this->payload['test_code'];
+
+            $uri = $this->qWorkerOrder->getInterfaceEndpoint(self::HL7_INTERFACE_UDID_ID, $eventUdid);
+
+            $apiPayload = $this->getApiPayload($this->order, $this->payload['report_id']);
+            $request = app(Request::class);
+            $authorization = $request->getServiceAuthorization(self::HL7_INTERFACE_UDID_ID);
+
+            $response = $request->callOutboundApiRequest(
+                $uri,
+                [
+                    'Authorization: '.$authorization['token'],
+                    'Client-Id: 1',
+                ],
+                $apiPayload,
+                $authorization['systemUserApiCredentialId']
+            );
+
+            if (! in_array($response['responseStatusCode'], [200, 201])) {
+                throw new Exception('Order transmission to Mulesoft failed');
+            }
+            $this->jobModel->addOutboundRequests($this->job->getLogId(), [$response['apiRequestId']]);
+
+            $orderEvent = $this->eventService->storeOrderEvent(
+                $this->order,
+                $eventUdid,
+                $this->payload['sourceSystemUdid'],
+                $inboundApiRequestId,
+                $this->job->getJobId(),
+                $response['apiRequestId'],
+                $testCodes
+            );
+
+            $status = $this->payload['rptStatusUdid'];
+
+            if ($status === 'CORRECTED') {
+                $conditionCode = 'RTRANC';
+            } elseif ($status === 'FINAL') {
+                $conditionCode = 'RTRANF';
+            } else {
+                $conditionCode = 'RTRANP';
+            }
+            $conditionDetail = $this->orderService->getCondition($conditionCode);
+            $this->order->conditions()->create([
+                'gid_condition_id' => $conditionDetail->gid_condition_id,
+            ]);
+            $this->createOrderConditionHistory($this->order, $orderEvent, $conditionDetail->gid_condition_id);
+            DB::commit();
+        } catch (Throwable $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    protected function getApiPayload(Order $order, int $reportId): array
+    {
+
+        $report = $order->report()->where('report_id', $reportId)->first();
+        $reportdetail = $report->reportDetails()->where('report_id', $report->report_id)->where('type', 'HL72.3')->first();
+
+        $interfaceQdibParams = json_decode($this->interfaceModel->getInterfaceMeta(self::HL7_INTERFACE_UDID_ID), true)['qdibParams'];
+        $gtwQdibParams = json_decode($this->systemModel->getSourceSystemMeta('GTW'), true)['qdibParams'];
+
+        $srcId = $interfaceQdibParams['qdibSrcInfXref'].$gtwQdibParams['qdibDefaultDelim'].
+            $gtwQdibParams['qlsSsidXref'].$gtwQdibParams['qdibDefaultDelim'].$gtwQdibParams['qdibDefaultSuff'];
+
+        if (empty($order->detail['provider']['physicianRequisitionId'])) {
+            $reqNum = 'NA';
+        } else {
+            $reqNum = $order->detail['provider']['physicianRequisitionId'];
+        }
+
+        $payload = [
+            'QdibEnvelope' => [
+                'header' => [
+                    'srcId' => $srcId,
+                    'appTs' => Carbon::now()->format('Y-m-d\TH:i:s'),
+                    'log' => $interfaceQdibParams['qdibLog'],
+                    'destId' => $interfaceQdibParams['qdibDestQueue'],
+                    'type' => $interfaceQdibParams['qdibMessageType'],
+                ],
+                'body' => [
+                    'rec' => [
+                        'md' => [
+                            'key' => [
+                                ['nm' => 'clientNum', 'vl' => $order->detail['client']['clientId']],
+                                ['nm' => 'seqNum', 'vl' => $report->sequence],
+                                ['nm' => 'reqNum', 'vl' => $reqNum],
+                                ['nm' => 'accNum', 'vl' => explode('.', $order->adid)[2]],
+                            ],
+                        ],
+                        'pl' => base64_encode($reportdetail->value),
+                    ],
+                ],
+            ],
+        ];
+
+        return $payload;
+    }
+
+    protected function createOrderConditionHistory(Order $order, OrderEvent $orderEvent, int $conditionCodeId): void
+    {
+        $order->conditionHistory()->create([
+            'gid_condition_id' => $conditionCodeId,
+            'order_event_id' => $orderEvent->order_event_id,
+        ]);
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Jobs\Harvester\OrderMessageHarvester;
+use App\Jobs\Harvester\WorkflowTrait;
+use App\Jobs\Parser\OrderMessageParser;
+use App\Models\Order\Order;
+use App\QWorker\JobModel\ApiModel;
+use App\QWorker\Traits\OrderJobHelperTrait;
+use App\Repositories\Queue\QueueRepository;
+use DB;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Throwable;
+
+class OrderEventDiscoveryJobV4 implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, OrderJobHelperTrait, Queueable, SerializesModels, WorkflowTrait;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_EVENT_DISCOVERY';
+
+    /**
+     * for post-mpdd job implementations
+     */
+    const JOB_VERSION = 4;
+
+    public function __construct(
+        protected array $payload,
+    ) {}
+
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $payload = $this->payload;
+
+            $api = app(ApiModel::class);
+
+            $apiPayload = $this->getMessage($api, $payload['apiRequestId']);
+            $message = $apiPayload['messages'][$payload['messageIndex']];
+            $payload['interfaceUdid'] = $apiPayload['interfaceUdid'] ?? $payload['interfaceUdid'];
+            $payload['messages'] = $apiPayload['messages'];
+            $parser = app(OrderMessageParser::class);
+            $harvester = app(OrderMessageHarvester::class);
+
+            $parser->setMessage($this->getPayload($message))->parse();
+            $harvester->setParser($parser)->setInterfaceUdid($apiPayload['interfaceUdid'])->harvest();
+            $orderAdid = $harvester->getAdid();
+            $order = Order::where('adid', $orderAdid)->first();
+            if (! empty($order?->order_id)) {
+                $payload['orderId'] = $order->order_id;
+            }
+            $nextJob = $harvester->getNextJob();
+            $eventMeta = $harvester->getEventMeta();
+
+            if (! class_exists($nextJob) || ! method_exists($nextJob, 'dispatch')) {
+                throw new \RuntimeException("Invalid job class: {$nextJob}");
+            }
+
+            $orderInductionJobPayload = [
+                'job' => $nextJob,
+                'job_type' => $eventMeta['nextJobQueue'],
+                'data' => $payload,
+            ];
+
+            $arr = [
+                'queue' => $orderInductionJobPayload['job_type'],
+                'payload' => new $orderInductionJobPayload['job']($payload),
+            ];
+
+            $fullArr = array_merge($arr, $payload);
+            app(QueueRepository::class)->queue(
+                'Illuminate\Queue\CallQueuedHandler@call',
+                $fullArr,
+                self::JOB_VERSION
+            );
+
+            DB::commit();
+        } catch (Throwable $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            // Use the CustomJobException
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT
+            );
+
+            $this->fail($customException);
+        }
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Models\Order\Test;
+use App\Repositories\V4\Order\OrderRepository;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+use Exception;
+
+class OrderEventUpdateJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    /**
+     * @var array Incoming job payload
+     */
+    protected array $payload;
+
+    /**
+     * @var int|null Internal event history tracking (not used directly)
+     */
+    protected ?int $eventHistoryId = null;
+
+    /**
+     * @var OrderRepository Handles database interaction with order conditions
+     */
+    protected OrderRepository $orderRepository;
+
+    const STARLIMS_INTERFACE_UDID = 'STARLIMS_HAYSTACK_ORDERS';
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_EVENT_CONSUME';
+
+    const JOB_VERSION = 4;
+
+    /**
+     * Constructor
+     *
+     * @param  array  $payload  The job payload containing order and processing info
+     * @param  OrderRepository  $orderRepository  Repository for accessing order conditions
+     */
+    public function __construct(array $payload)
+    {
+        $this->payload = $payload;
+        $this->orderRepository = app(OrderRepository::class);
+    }
+
+    /**
+     * Main job handler
+     *
+     * Processes the incoming order update event by:
+     * - Updating patient/client/test data
+     * - Creating order events
+     * - Setting/unsetting condition codes
+     */
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+
+            $orderId = $this->job->getOrderId();
+            $jobId = $this->job->getLogId();
+            $order = $this->orderRepository->getOrder($orderId);
+            $productDefinition = $order->productDefinition;
+
+            $updatedResultValues = $this->payload['testData'] ?? [];
+            if (! empty($this->payload['newPatientData']) || isset($this->payload['newClientData']) || ! empty($updatedResultValues)) {
+                if (! empty($order)) {
+                    $orderDetails = $order->detail;
+
+                    if (! empty($this->payload['newPatientData'])) {
+                        $this->updateOrderPatient($this->payload['newPatientData'], $orderDetails);
+                    }
+
+                    if (isset($this->payload['newClientData'])) {
+                        $this->updateClient($this->payload['newClientData'], $orderDetails);
+                    }
+
+                    if (! empty($updatedResultValues)) {
+                        $this->updateOrderTestData($updatedResultValues, $orderId);
+                    }
+                    $order->detail = $orderDetails;
+                    $order->save();
+                    $eventService = app(EventService::class);
+                    $testCodes = $this->orderRepository->getTestCode($order);
+                    $testCodes = ! empty($testCodes) ? explode(',', $testCodes)[0] : '';
+                    $eventService->storeOrderEvent(
+                        $order,
+                        $this->payload['systemEventUdid'],
+                        $order->detail['meta']['sourceSystemUdid'],
+                        $this->payload['apiRequestId'],
+                        $jobId,
+                        0,
+                        $testCodes
+                    );
+                }
+
+                $orderedTest = $productDefinition->test_code;
+
+                if ($productDefinition && $productDefinition->config_data) {
+                    $endpointRouting = $productDefinition->config_data;
+                    $publishConfig = $endpointRouting['PublishToTechnical'] ?? null;
+                    if ($publishConfig) {
+                        $newPayload = [
+                            'orderId' => $orderId,
+                            'event' => $this->payload['systemEventUdid'],
+                            'apiRequestId' => $this->payload['apiRequestId'],
+                            'jobChainOriginSourceSystemId' => $this->payload['jobChainOriginSourceSystemId'],
+                            'interfaceUdid' => $publishConfig['interfaceUdid'] ?? self::STARLIMS_INTERFACE_UDID,
+                            'eventUdid' => $publishConfig['eventUdid'] ?? 'WIP_OUT_ORDER_TECH',
+                            'newPatientData' => $this->payload['newPatientData'],
+                            'newClientData' => $this->payload['newClientData'],
+                            'existingPatientAndClientData' => $this->payload['existingPatientAndClientData'],
+                            'outboundInterfaceExpectedResponse' => $publishConfig['outboundInterfaceExpectedResponse'] ?? '',
+                            'testXref' => $orderedTest,
+                            'updatedResultValues' => $updatedResultValues,
+                        ];
+
+                        $orderJobSpawner = app(OrderJobSpawnerV4::class);
+                        $orderJobSpawner->spawn(get_class($this), [
+                            'orderId' => $orderId,
+                            'data' => $newPayload,
+                        ]);
+                    }
+                }
+            }
+            DB::commit();
+        } catch (Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    /**
+     * Update patient fields inside the order details
+     *
+     * @param  array  $testData  The updated patient info
+     * @param  array  &$orderDetails  Reference to the full order detail array
+     */
+    protected function updateOrderPatient(array $newPatientData, array &$orderDetails): void
+    {
+        foreach ($newPatientData as $sourceKey => $targetFieldValue) {
+            if (isset($orderDetails['patient'][$sourceKey])) {
+                if (! is_null($targetFieldValue)) {
+                    $orderDetails['patient'][$sourceKey] = $targetFieldValue;
+                }
+            }
+        }
+    }
+
+    /**
+     * Update client-related data in order details
+     *
+     * @param  array  $testData  The new client values
+     * @param  array  &$orderDetails  Reference to order detail structure
+     */
+    protected function updateClient(array $newClientData, array &$orderDetails): void
+    {
+        foreach ($newClientData as $sourceKey => $targetFieldValue) {
+            if (isset($orderDetails['client'][$sourceKey])) {
+                if (! is_null($targetFieldValue)) {
+                    $orderDetails['client'][$sourceKey] = $targetFieldValue;
+                }
+            }
+        }
+    }
+
+    /**
+     * Update test data for a specific order
+     *
+     * @param  array  $updatedTestData  New test result data
+     * @param  int  $orderId  The order's unique ID
+     */
+    protected function updateOrderTestData(array $updatedTestData, int $orderId): void
+    {
+        foreach ($updatedTestData as $testId => $groupedRecords) {
+            $test = Test::where('order_id', $orderId)
+                ->where('test_id', $testId)
+                ->first();
+
+            if (! $test) {
+                continue;
+            }
+            $existingDetail = $test->detail ?? [];
+            foreach ($groupedRecords as $groupIndex => $updatedRecords) {
+                $indexNumber = $this->findIndexByKey($existingDetail[0], 'SRCId', $updatedRecords['SRCId']);
+                if (! is_null($indexNumber)) {
+                    $existingDetail[0][$indexNumber] = $updatedRecords;
+                }
+            }
+            $test->detail = $existingDetail;
+            $test->save();
+        }
+    }
+
+    public function findIndexByKey(array $array, string $targetKey, string $targetValue)
+    {
+        foreach ($array as $index => $element) {
+            if (is_array($element) && isset($element[$targetKey]) && $element[$targetKey] === $targetValue) {
+                return $index;
+            }
+        }
+
+        return null;
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Jobs\Harvester\OrderMessageHarvester;
+use App\Jobs\Parser\OrderMessageParser;
+use App\Models\Master\SourceSystem;
+use App\Models\Order\Order;
+use App\Models\Product\ProductDefinitions;
+use App\Repositories\Queue\QueueRepository;
+use App\Repositories\V4\Order\OrderRepository;
+use Exception;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+
+class OrderEventUpdatePrepJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    private array $payload;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_EVENT_CONSUME';
+
+    const JOB_VERSION = 4;
+
+    protected $orderModel;
+
+    public function __construct(array $payload)
+    {
+        $this->payload = $payload;
+        $this->orderModel = app(OrderRepository::class);
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+
+            $parser = app(OrderMessageParser::class);
+            $harvester = app(OrderMessageHarvester::class);
+            $payload = $this->payload;
+
+            $orderId = $this->job->getOrderId();
+
+            $order = $this->orderModel->getOrder($orderId);
+            $hl7Message = base64_decode($payload['messages'][0]['payload']);
+            $parser->setMessage($hl7Message)->parse();
+
+            $harvestedData = $harvester
+                ->setParser($parser)
+                ->setInterfaceUdid($payload['interfaceUdid'])
+                ->harvest();
+
+            $patientAndClientData = $this->getOrderDetails($orderId);
+            $eventUdid = $harvestedData['meta']['eventUdid'];
+
+            $newPayload['existingPatientAndClientData'] = $patientAndClientData;
+            $newPayload['newPatientData'] = $this->getChangedPatientData($harvestedData['fields'], $patientAndClientData);
+            $newPayload['newClientData'] = $this->getChangedClientData($harvestedData['fields'], $patientAndClientData);
+
+            $testData = $this->getMultiTestDataFormat($harvestedData, $order);
+            $newPayload['apiRequestId'] = $this->payload['apiRequestId'];
+            $newPayload['systemEventUdid'] = $eventUdid;
+            $newPayload['testData'] = $testData;
+            $newPayload['orderId'] = $orderId;
+            $newPayload['jobChainOriginSourceSystemId'] = $this->getSourceSystemId($harvestedData['meta']['sourceSystemUdid']);
+
+            $orderInductionJobPayload = [
+                'job' => OrderEventUpdateJobV4::class,
+                'job_type' => 'UPDATE',
+                'data' => $newPayload,
+            ];
+            $arr = [
+                'queue' => $orderInductionJobPayload['job_type'],
+                'payload' => new $orderInductionJobPayload['job']($orderInductionJobPayload['data']),
+            ];
+            $fullArr = array_merge($arr, $orderInductionJobPayload['data']);
+            app(QueueRepository::class)->queue(
+                'Illuminate\Queue\CallQueuedHandler@call',
+                $fullArr,
+                self::JOB_VERSION
+            );
+            DB::commit();
+        } catch (Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    private function getMultiTestDataFormat(array $harvestedData, Order $order): array
+    {
+        $final = [];
+        foreach ($order->tests as $test) {
+            $productDefinitonData = ProductDefinitions::where('test_code', $test->test_code)
+                ->first();
+            $obxData = $productDefinitonData->test_structure['properties']['items']['elements']['obx']['elements'] ?? [];
+
+            $testId = $test->test_id;
+            if (empty($test->detail)) {
+                continue;
+            }
+            $existingDataMap = [];
+            foreach ($test->detail as $groupIndex => $group) {
+                foreach ($group as $obx) {
+                    if (! empty($obx['SRCId'])) {
+                        $existingDataMap[$obx['SRCId']] = $obx;
+                    }
+                }
+            }
+
+            foreach ($harvestedData['items'] as $itemIndex => $item) {
+                if (empty($item['obx'])) {
+                    continue;
+                }
+
+                $updatedObxList = [];
+                foreach ($item['obx'] as $obx) {
+                    $srcId = $obx['SRCId'] ?? null;
+                    if (! $srcId) {
+                        continue;
+                    }
+
+                    if (! isset($existingDataMap[$srcId])) {
+                        $updatedObxList[] = $this->updateNomenclature($obx, $obxData);
+                    } elseif ($existingDataMap[$srcId] != $obx) {
+                        $updatedObxList[] = $this->updateNomenclature($obx, $obxData);
+                    }
+                }
+
+                if (! empty($updatedObxList)) {
+                    $final[$testId] = $updatedObxList;
+                }
+            }
+        }
+
+        return $final;
+    }
+
+    public function updateNomenclature(array $hl7Data, array $obxData): array
+    {
+        foreach ($obxData as $key => $value) {
+            if ($hl7Data['99QDISRCID'] == $value['src']) {
+                $hl7Data['nomenclature'] = $value['nomenclature'];
+            }
+        }
+
+        return $hl7Data;
+    }
+
+    public function getSourceSystemId(string $sourceSystemUdId): int
+    {
+        $sourceSystem = SourceSystem::where('udid', $sourceSystemUdId)->first();
+        if (! isset($sourceSystem->source_system_id)) {
+            throw new \RuntimeException("SourceSystem not found for UDID: {$sourceSystemUdId}");
+        }
+
+        return $sourceSystem->source_system_id;
+    }
+
+    public function getOrderDetails(int $orderId): array
+    {
+        $order = Order::where('order_id', $orderId)->first();
+
+        return $order->detail;
+    }
+
+    protected function getChangedPatientData(array $incomingData, array $existingData): array
+    {
+        $existingData['patient']['patientDOB'] = str_replace('-', '', $existingData['patient']['patientDOB']);
+        $updatedValues = [];
+        foreach ($incomingData as $key => $value) {
+            if (isset($existingData['patient'][$key])) {
+                if (isset($value) && ($existingData['patient'][$key] != $value)) {
+                    $updatedValues[$key] = $value;
+                }
+                if ($existingData['patient'][$key] === 'patientInitials' && empty($value)) {
+                    $updatedValues['patientInitials'] = '';
+                }
+            }
+        }
+
+        return $updatedValues;
+    }
+
+    protected function getChangedClientData(array $incomingData, array $existingData): array
+    {
+        $updatedValues = [];
+
+        $updatedValues['xref'] = $existingData['client']['clientId'];
+
+        foreach ($incomingData as $key => $value) {
+            if (isset($existingData['client'][$key])) {
+                if (isset($value) && $existingData['client'][$key] != $value) {
+                    $updatedValues[$key] = $value;
+                }
+            }
+        }
+
+        return $updatedValues;
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Exceptions\RuntimeException;
+use App\Http\Services\V4\EventService;
+use App\Jobs\Harvester\OrderMessageHarvester;
+use App\Jobs\Harvester\WorkflowTrait;
+use App\Jobs\Parser\OrderMessageParser;
+use App\Jobs\Util\OrderValidator;
+use App\Models\Master\Gid\MasterGidCondition;
+use App\Models\Master\SampleType;
+use App\Models\Master\SourceSystem;
+use App\Models\Order\Order;
+use App\Models\Order\OrderCondition;
+use App\Models\Order\OrderEvent;
+use App\Models\Order\Test;
+use App\Models\Product\InterfaceConfiguration;
+use App\Models\Product\ProductDefinitions;
+use App\Models\Product\ProductInterfaceConfiguration;
+use App\QWorker\JobModel\ApiModel;
+use App\QWorker\JobModel\Queue\JobModel;
+use App\QWorker\Traits\OrderJobHelperTrait;
+use App\Repositories\V4\Order\OrderRepository;
+use Carbon\Carbon;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+class OrderInductionJobV4 implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, OrderJobHelperTrait, Queueable, SerializesModels, WorkflowTrait;
+
+    const NEW_ORDER_EVENT = 'INB_ORD_CREATED';
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_CREATE';
+
+    /**
+     * @var OrderMessageHarvester
+     */
+    protected $harvester;
+
+    /**
+     * @var OrderRepository Handles database interaction with order conditions
+     */
+    protected OrderRepository $orderRepository;
+
+    public function __construct(
+        protected array $payload,
+    ) {
+        $this->orderRepository = app(OrderRepository::class);
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $payload = $this->payload;
+            $api = app(ApiModel::class);
+
+            $apiPayload = $this->getMessage($api, $payload['apiRequestId']);
+
+            $message = $apiPayload['messages'][$payload['messageIndex']];
+
+            $this->harvester = app(OrderMessageHarvester::class);
+            $parser = app(OrderMessageParser::class);
+            $parser->setMessage($this->getPayload($message))->parse();
+
+            $inboundApiRequestId = $payload['apiRequestId'];
+            $interfaceUdid = $payload['interfaceUdid'];
+
+            $harvestedData = $this
+                ->harvester
+                ->setParser($parser)
+                ->setInterfaceUdid($interfaceUdid)
+                ->harvest();
+
+            $adid = $this->harvester->getAdid();
+            // preserve a copy of original harvested data for validation
+            $originalHarvestedData = json_decode(json_encode($harvestedData), true);  // Deep copy
+
+            $harvestedData['patient'] = $this->getPatient($harvestedData);
+            $harvestedData['provider'] = $this->getProvider($harvestedData);
+            $harvestedData['client'] = $this->getClient($harvestedData);
+
+            $combined = array_merge($harvestedData['patient'], $harvestedData['provider'], $harvestedData['client']);
+            $uniqueFields = array_diff_key($harvestedData['fields'], $combined);
+            $harvestedData['fields'] = $uniqueFields;
+
+            // Analyze all items to determine order structure
+            $orderStructure = $this->analyzeOrderStructure($harvestedData['items'], $originalHarvestedData, $interfaceUdid);
+
+            $harvestedData['items'] = $orderStructure['updatedItems'];
+            $order = $this->createOrder($orderStructure, $harvestedData, $adid);
+            $jobModel = app(JobModel::class);
+            $jobId = isset($this->payload['job_id']) ? (int) $this->payload['job_id'] : (int) $this->job->getLogId();
+            $ordeId = isset($payload['orderId']) ? $payload['orderId'] : (int) $order->order_id;
+
+            $jobModel->setJobOrderId($jobId, $ordeId);
+
+            $this->createAllTests($order, $orderStructure, $harvestedData);
+
+            // TODO check if we should add $CompleteJobEvent->check as OrderInductionJobV2
+
+            if ($order) {
+                $this->createNewOrderCondition($order, $inboundApiRequestId);
+                $orderJobSpawner = app(OrderJobSpawnerV4::class);
+
+                $orderJobSpawner->spawn(get_class($this), [
+                    'orderId' => $ordeId,
+                    'data' => [
+                        'apiRequestId' => $payload['apiRequestId'],
+                        'address' => $parser->getAddress(),
+                    ],
+                ]);
+            }
+
+            DB::commit();
+        } catch (Throwable $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+            // Use the CustomJobException
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT
+            );
+
+            $this->fail($customException);
+        }
+    }
+
+    private function transformObxSegments(array $harvestedItems, array $obxesInProductDefinition): array
+    {
+        $updatedObxes = [];
+        foreach ($harvestedItems as $obxSegment) {
+            foreach ($obxesInProductDefinition['elements'] as $key => $structure) {
+                if ($obxSegment['SRCId'] === $structure['src']) {
+                    $updatedObxes[$key] = $obxSegment;
+
+                    continue;
+                }
+            }
+        }
+
+        return $updatedObxes;
+    }
+
+    private function analyzeOrderStructure(array $items, array $originalHarvestedData, string $interfaceUdid): array
+    {
+        $parentTestCodes = [];
+        $productDefinitions = [];
+        $validatedTests = [];
+        $updatedItems = [];
+
+        // First pass: collect all parent test codes and validate
+        foreach ($items as $index => $harvestedItem) {
+            $testCodeXref = str_replace('%', '', $harvestedItem['fields']['99QDITestID']);
+            $prodDefinition = ProductDefinitions::where([
+                'test_code_xref' => $testCodeXref,
+                'is_active' => 1,
+            ])->first();
+
+            $this->validateInterfaceUdid($interfaceUdid, $prodDefinition->product_definitions_id, $prodDefinition->test_code);
+            $this->validateOrderInput($originalHarvestedData, $prodDefinition);
+
+            $productDefinitions[$index] = $prodDefinition;
+            $validatedTests[] = $index;
+
+            $updatedItem = $harvestedItem;
+            if (isset($harvestedItem['obx'])) {
+                $obxesStructure = $prodDefinition->test_structure['properties']['items']['elements']['obx'];
+                $transformedObxes = $this->transformObxSegments($harvestedItem['obx'], $obxesStructure);
+                $updatedItem['obx'] = $transformedObxes;
+            }
+            $updatedItems[$index] = $updatedItem;
+
+            if ($prodDefinition->parent_test_code) {
+                $parentTestCodes[] = $prodDefinition->parent_test_code;
+            }
+        }
+
+        // Determine order structure based on parent test codes
+        $uniqueParentCodes = array_unique($parentTestCodes);
+        $orderType = 'standalone';  // Default
+        $orderProductDefinition = null;
+        $parentTestCode = null;
+
+        if (count($uniqueParentCodes) === 1) {
+            // All tests share the same parent - use parent for order
+            $parentTestCode = $uniqueParentCodes[0];
+            $parentProdDef = ProductDefinitions::where([
+                'test_code' => $parentTestCode,
+                'is_active' => 1,
+            ])->first();
+
+            $this->validateInterfaceUdid($interfaceUdid, $parentProdDef->product_definitions_id, $parentTestCode);
+            $this->validateOrderInput($originalHarvestedData, $parentProdDef);
+
+            $orderType = 'parent';
+            $orderProductDefinition = $parentProdDef;
+        }
+
+        // If no valid parent structure, use the first validated test for the order
+        if (! $orderProductDefinition && ! empty($validatedTests)) {
+            $firstTestIndex = $validatedTests[0];
+            $orderProductDefinition = $productDefinitions[$firstTestIndex];
+            $orderType = 'standalone';
+        }
+
+        return [
+            'type' => $orderType,
+            'productDefinition' => $orderProductDefinition,
+            'parentTestCode' => $parentTestCode,
+            'testDefinitions' => $productDefinitions,
+            'validatedTests' => $validatedTests,
+            'updatedItems' => $updatedItems,
+        ];
+    }
+
+    private function createOrder(array $orderStructure, array $harvestedData, string $adid): Order
+    {
+        if (! $orderStructure['productDefinition']) {
+            throw new RuntimeException('No valid product definition found for order creation');
+        }
+
+        $order = Order::create([
+            'product_definitions_id' => $orderStructure['productDefinition']->product_definitions_id,
+            'detail' => array_merge(
+                $this->removeObxSections($harvestedData),
+                $harvestedData['patient'],
+                $harvestedData['provider'],
+                $harvestedData['client']
+            ),
+            'adid' => $adid,
+        ]);
+
+        return $order;
+    }
+
+    private function createAllTests(Order $order, array $orderStructure, array $harvestedData): void
+    {
+        $parentTest = null;
+
+        // If this is a parent-type order, create the parent test first
+        if ($orderStructure['type'] === 'parent' && $orderStructure['parentTestCode']) {
+            $parentTest = $this->createParentTest($order, $orderStructure['parentTestCode'], $harvestedData);
+        }
+
+        if ($parentTest) {
+            $this->createSamples($parentTest, $harvestedData);
+        }
+
+        // Create all child/regular tests
+        foreach ($orderStructure['validatedTests'] as $itemIndex) {
+            $harvestedItem = $harvestedData['items'][$itemIndex];
+            $testDefinition = $orderStructure['testDefinitions'][$itemIndex];
+
+            // Determine if this should be a child test
+            $shouldBeChild = ($orderStructure['type'] === 'parent' &&
+                $testDefinition->parent_test_code === $orderStructure['parentTestCode']);
+
+            $singleTest = $this->createTest($order, $harvestedItem, $shouldBeChild ? $parentTest : null);
+            if (! $parentTest) {
+                $this->createSamples($singleTest, $harvestedData);
+            }
+        }
+    }
+
+    private function createParentTest(Order $order, string $parentTestCode, array $harvestedData): ?Test
+    {
+        $parentTestCodeProdDef = ProductDefinitions::where([
+            'test_code' => $parentTestCode,
+            'is_active' => 1,
+        ])->first();
+
+        $parentTest = null;
+        // TODO determine from where a non-virtual parent test would get its detail
+        if ($parentTestCodeProdDef->is_virtual) {
+            $parentTest = $order->tests()->create([
+                'test_code' => $parentTestCode,
+                'test_code_xref' => $parentTestCode,
+                'product_definitions_id' => $parentTestCodeProdDef->product_definitions_id,
+                'detail' => [],  // Virtual tests have empty detail
+                'parent_id' => null,
+            ]);
+        }
+
+        return $parentTest;
+    }
+
+    private function validateOrderInput($harvestedData, $productDefinitions)
+    {
+        $testStructure = $productDefinitions->test_structure;
+        $validator = new OrderValidator($testStructure);
+        $errors = $validator->validate($harvestedData);
+
+        if (! empty($errors)) {
+            Log::error('JSON validation errors:', $errors);
+            throw new RuntimeException('Failed to validate order data: '
+                .$productDefinitions->test_code.' - '.json_encode($errors, JSON_PARTIAL_OUTPUT_ON_ERROR));
+        }
+    }
+
+    private function getProductDefinition(string $testCode): ProductDefinitions
+    {
+        return ProductDefinitions::where([
+            'test_code' => $testCode,
+            'is_active' => 1,
+        ])->firstOr(function () use ($testCode) {
+            Log::error('Failed to fetch product definitions', [
+                'test_code' => $testCode,
+            ]);
+            throw new RuntimeException('Failed to fetch product definitions for test code: '.$testCode);
+        });
+    }
+
+    private function validateInterfaceUdid(string $interfaceUdid, int $productDefinitionsId, string $testCode): void
+    {
+        $interfaceIdList = ProductInterfaceConfiguration::where('product_definitions_id', $productDefinitionsId)
+            ->pluck('interface_configuration_id')
+            ->toArray();
+
+        $interfaceId = InterfaceConfiguration::where('interface_udid', $interfaceUdid)
+            ->value('interface_configuration_id');
+
+        // Check if the provided interface UDID exists in the list
+        if (! in_array($interfaceId, $interfaceIdList)) {
+            Log::error('Interface UDID not found in product interface configurations.', [
+                'interfaceUdid' => $interfaceUdid,
+                'productDefinitionsId' => $productDefinitionsId,
+            ]);
+
+            throw new RuntimeException('Invalid interface UDID: '.$interfaceUdid.' for test code: '.$testCode);
+        }
+    }
+
+    private function createTest(Order $order, array $harvestedItem, ?Model $parentTest = null): Test
+    {
+        $testCodeXref = $harvestedItem['fields']['99QDITestID'];
+        $testCodeXref = str_replace('%', '', $testCodeXref);
+        $testCodeProdDef = ProductDefinitions::where([
+            'test_code_xref' => $testCodeXref,
+            'is_active' => 1,
+        ])->first();
+
+        if ($parentTest) {
+            $this->verifyParentTestCode($testCodeProdDef, $parentTest->test_code);
+        }
+        $obxData = $testCodeProdDef->test_structure['properties']['items']['elements']['obx']['elements'] ?? [];
+
+        $testCode = $testCodeProdDef->test_code;
+
+        return $order->tests()->create([
+            'test_code' => $testCode,
+            'product_definitions_id' => $testCodeProdDef->product_definitions_id,
+            'test_code_xref' => $testCodeXref,
+            'product_definitions_id' => $testCodeProdDef->product_definitions_id,
+            'detail' => $this->getObxSections($harvestedItem, $obxData),
+            'parent_id' => $parentTest?->test_id,
+        ]);
+    }
+
+    private function verifyParentTestCode($testCodeProductDefinition, $parentTestCode): void
+    {
+        if ($testCodeProductDefinition->parent_test_code !== $parentTestCode) {
+            Log::error('Parent test code mismatch', [
+                'expected' => $testCodeProductDefinition->parent_test_code,
+                'actual' => $parentTestCode,
+            ]);
+            throw new RuntimeException('Parent test code mismatch for test code: '.$testCodeProductDefinition->test_code
+                .'. Expected: '.$testCodeProductDefinition->parent_test_code
+                .', Actual: '.$parentTestCode);
+        }
+    }
+
+    // we remove the obx section from order detail, since it goes to test info
+    private function removeObxSections(array $data): array
+    {
+        foreach ($data as $key => $value) {
+            if (is_array($value)) {
+                if ($key === 'obx') {
+                    unset($data[$key]);
+                } else {
+                    $data[$key] = $this->removeObxSections($value);
+                }
+            }
+        }
+
+        return $data;
+    }
+
+    private function getObxSections(array $data, array $prodOBXData): array
+    {
+        $obxSections = [];
+
+        foreach ($data as $key => $value) {
+            if (is_array($value)) {
+                if ($key === 'obx') {
+                    $obxSections[] = $this->updateNomenclature($value, $prodOBXData);
+                } else {
+                    $obxSections = array_merge($obxSections, $this->getObxSections($value, $prodOBXData));
+                }
+            }
+        }
+
+        return $obxSections;
+    }
+
+    public function updateNomenclature(array $hl7Data, array $obxData): array
+    {
+        foreach ($hl7Data as $key => $value) {
+            if (array_key_exists($key, $obxData)) {
+                $hl7Data[$key]['nomenclature'] = $obxData[$key]['nomenclature'];
+            }
+        }
+
+        return $hl7Data;
+    }
+
+    private function createNewOrderCondition(Order $order, $inboundApiRequestId): void
+    {
+        $openConditionCodeId = $this->getConditionId('OPEN');
+
+        $sourceSystemUdid = $this->harvester->getSourceSystemUdid();
+
+        $this->createCondition($order, $openConditionCodeId);
+        $eventService = app(EventService::class);
+        $jobId = isset($this->payload['job_id']) ? (int) $this->payload['job_id'] : (int) $this->job->getLogId();
+        $testCodes = $this->orderRepository->getTestCode($order);
+        $testCodes = ! empty($testCodes) ? explode(',', $testCodes)[0] : '';
+        $orderEvent = $eventService->storeOrderEvent(
+            $order,
+            self::NEW_ORDER_EVENT,
+            $sourceSystemUdid,
+            $inboundApiRequestId,
+            $jobId,
+            0,
+            $testCodes
+        );
+        $this->createOrderConditionHistory($order, $orderEvent, $openConditionCodeId);
+    }
+
+    private function getConditionId(string $conditionCode): int
+    {
+        $masterGidCondition = MasterGidCondition::where('udid', $conditionCode)->get(['gid_condition_id', 'udid'])->first();
+
+        return $masterGidCondition->gid_condition_id;
+    }
+
+    private function createCondition(Order $order, int $conditionCodeId): OrderCondition
+    {
+        return $order->conditions()->create([
+            'gid_condition_id' => $conditionCodeId,
+        ]);
+    }
+
+    private function createOrderConditionHistory(Order $order, OrderEvent $orderEvent, int $conditionCodeId): void
+    {
+        $order->conditionHistory()->create([
+            'gid_condition_id' => $conditionCodeId,
+            'order_event_id' => $orderEvent->order_event_id,
+        ]);
+    }
+
+    private function createSamples(Test $test, array $harvestedData): void
+    {
+        $samples = $this->getSamples($harvestedData);
+        foreach ($samples as $sample) {
+            if (! $sample['sampleTypeId']) {
+                Log::error('Sample type ID is missing for sample', [
+                    'sample' => $sample,
+                ]);
+
+                continue;  // Skip this sample if no sample type ID is found
+            }
+            $test->samples()->create([
+                'sample_type_id' => $sample['sampleTypeId'],
+                'sourceSystemXref' => $sample['sourceSystemXref'],
+                'collectionDatetime' => $this->formatCollectionDate($sample['collectionDate'], 'Y-m-d H:i:s'),
+                'collectionDatetimeTz' => $sample['collectionDatetimeTz'],
+            ]);
+        }
+    }
+
+    private function formatCollectionDate(string $datetimeStr, string $format): string
+    {
+        $dt = Carbon::createFromFormat('YmdHisO', $datetimeStr);
+
+        return $dt->format($format);
+    }
+
+    private function getPatient(array $data): array
+    {
+        $fields = $data['fields'];
+
+        return [
+            'mrid' => array_exists('PMRN', $fields, null),
+            'qdpnum' => array_exists('QDPNUM', $fields, null),
+            'patientSex' => $fields['patientSex'],
+            'patientDOB' => $fields['patientDOB'],
+            'patientAge' => ($fields['patientAge'] ?? 0),
+            'patientGivenName' => $fields['patientGivenName'],
+            'patientSurname' => $fields['patientSurname'],
+            'patientInitials' => $fields['patientInitials'],
+            'patientNameSuffix' => $fields['patientNameSuffix'],
+            'patientNamePrefix' => $fields['patientNamePrefix'],
+            'patientNameTypeCode' => $fields['patientNameTypeCode'],
+            'patientNameDegree' => $fields['patientNameDegree'],
+            'patientMaidenSurname' => $fields['patientMaidenSurname'],
+            'patientMaidenGivenName' => $fields['patientMaidenGivenName'],
+            'patientMaidenAdditionalGivenNames' => $fields['patientMaidenAdditionalGivenNames'],
+            'patientAlternateId' => $fields['patientAlternateId'],
+            // 'orderExternalPatientId' => $orderExternalPatientId,
+            // 'qdpidId' => $qdpidId,
+        ];
+    }
+
+    private function getProvider(array $data): array
+    {
+        // @TODO These OPRV* should be replaced with jsonUdids or removed
+        // kept here for compatibility with OrderMessageStoreV2
+        $fields = $data['fields'];
+        $npi = ($fields['OPRV_NTC'] ?? '') == 'NPI' && ! empty($fields['providerID'])
+            ? $fields['providerID']
+            : 0;
+
+        // repeater field NPI
+        $npiOprv = $fields['OPRVNPI'] ?? null;
+
+        // in case NPI is different from direct field and repeater field
+        if ($npi !== 0 && $npi === $npiOprv) {
+            throw new \Exception('NPI mismatch detected from OPRVNPI and OPRV_NTC fields.');
+        }
+
+        $npi = $npiOprv ?? $npi;
+        $givenName = $fields['physicianGivenName'] ?? $fields['OPRVNPI_GNM'] ?? '';
+        $surname = $fields['physicianSurname'] ?? $fields['OPRVNPI_SNM'] ?? '';
+        $initials = $fields['physicianAdditionalNames'] ?? $fields['OPRVNPI_MNM'] ?? '';
+        $upin = $fields['OPRVUPIN'] ?? null;
+
+        return [
+            'npi' => $npi,
+            'physicianGivenName' => $givenName,
+            'physicianSurname' => $surname,
+            'physicianAdditionalNames' => $initials,
+            'providerID' => $fields['providerID'],
+            'upin' => $upin,
+            'physicianRequisitionId' => $fields['physicianRequisitionId'],
+            'physicianAddressType' => $fields['physicianAddressType'],
+            'physicianAddressPostal' => $fields['physicianAddressPostal'],
+            'physicianAddressRegion' => $fields['physicianAddressRegion'],
+            'physicianAddressStreet' => $fields['physicianAddressStreet'],
+            'physicianAddressCountry' => $fields['physicianAddressCountry'],
+            'physicianAddressLocality' => $fields['physicianAddressLocality'],
+            'physicianAdditionalGivenNames' => $fields['physicianAdditionalGivenNames'],
+        ];
+    }
+
+    private function getClient(array $data): array
+    {
+        $fields = $data['fields'];
+
+        return [
+            'clientId' => $fields['clientId'],
+            'clientName' => $fields['clientName'],
+            'clientPhone' => $fields['clientPhone'],
+            'clientAddressPostal' => $fields['clientAddressPostal'],
+            'clientAddressRegion' => $fields['clientAddressRegion'],
+            'clientAddressCountry' => $fields['clientAddressCountry'],
+            'clientAddressLocality' => $fields['clientAddressLocality'],
+            'clientAddressStreetLN1' => $fields['clientAddressStreetLN1'],
+            'clientAddressStreetLN2' => $fields['clientAddressStreetLN2'],
+        ];
+    }
+
+    private function getSamples(array $data): array
+    {
+        $sourceSystemUdid = $data['meta']['sourceSystemUdid'];
+        $sourceSystem = SourceSystem::where('udid', $sourceSystemUdid)->first();
+
+        $sourceSystemId = null;
+        if ($sourceSystem) {
+            $sourceSystemId = (int) $sourceSystem->source_system_id;
+        }
+
+        $samples = $processedSamples = [];
+        foreach ($data['items'] as $itemIndex => $test) {
+            if (! array_exists('zsi', $test)) {
+                // This test (OBR) doesn't have a ZSI (sample) segment so we skip
+                continue;
+            }
+
+            $first = $test['zsi'][array_key_first($test['zsi'])];
+            if (Arr::exists($test, 'zsi.0.qlsSampleID') && in_array($first['qlsSampleID'], $processedSamples)) {
+                // Duplicate ZSI on a different OBR, ignore
+                continue;
+            }
+
+            $sampleType = SampleType::select('sample_type_id')
+                ->where('source_system_id', $sourceSystemId)
+                ->where('source_system_xref', $first['qlsSampleType'])
+                ->first();
+
+            $sampleTypeId = null;
+            if ($sampleType) {
+                $sampleTypeId = (int) $sampleType->sample_type_id;
+            }
+
+            $samples[] = [
+                'sampleTypeId' => $sampleTypeId,
+                'qlsSampleType' => $first['qlsSampleType'],
+                'sourceSystemXref' => $first['qlsSampleID'],
+                'collectionDate' => $test['fields']['specimenCollectedOn'],
+                'collectionDatetime' => $test['fields']['specimenCollectedOn'],
+                'collectionDatetimeTz' => $test['fields']['specimenCollectedOnTZ'],
+            ];
+
+            $processedSamples[] = $first['qlsSampleID'];
+        }
+
+        return $samples;
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Models\Order\Order;
+use App\Models\Tran\Queue\JobLog;
+use App\QWorker\JobModel\Order\OrderModel;
+use App\QWorker\Queue\JobSpawner;
+use App\QWorker\Support\Arr;
+use App\Repositories\Queue\QueueRepository;
+use Illuminate\Database\Eloquent\Casts\Json;
+use Mini\Model\Model;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * A generic job spawner.
+ */
+class OrderJobSpawnerV4 extends JobSpawner
+{
+    /**
+     * Job queue.
+     *
+     * @var \App\QWorker\JobModel\Order\OrderModel|null
+     */
+    protected $model = null;
+
+    /**
+     * Order data.
+     *
+     * @var \App\QWorker\Order\Order
+     */
+    protected $order = null;
+
+    const JOB_VERSION = 4;
+
+    /**
+     * Setup.
+     *
+     * @param  Order  $order  order logic
+     * @param  OrderModel  $model  order data
+     */
+    public function __construct(Order $order, OrderModel $model)
+    {
+        parent::__construct();
+
+        $this->model = $model;
+        $this->order = $order;
+    }
+
+    public function queueMessage(array $interfaceConfig, int $apiRequestId, int $messageIndex): JobLog|Model
+    {
+        // Prepare the payload
+        $payload = [
+            'apiRequestId' => $apiRequestId,
+            'messageIndex' => $messageIndex,
+            'dispatcherJobConfig' => $interfaceConfig['dispatcherJobConfig'],
+        ];
+
+        // Pass the payload when creating the job
+        return app(QueueRepository::class)->queue(
+            'Illuminate\\Queue\\CallQueuedHandler@call',
+            [
+                'queue' => $interfaceConfig['dispatcherJobToQueue']['queueType'],
+                'payload' => new $interfaceConfig['dispatcherJobToQueue']['job']($payload), // Pass the payload here
+                'apiRequestId' => $apiRequestId,
+                'messageIndex' => $messageIndex,
+                'dispatcherJobConfig' => $interfaceConfig['dispatcherJobConfig'],
+                'interfaceUdid' => $interfaceConfig['identity']['interface'],
+            ],
+            self::JOB_VERSION
+        );
+    }
+
+    /**
+     * Spawn a job.
+     *
+     * @param  string  $jobClass  namespace of the job class
+     * @param  array  $overrides  optional overrides for the job keys
+     */
+    public function spawn(string $jobClass, array $overrides = []): void
+    {
+
+        if (Arr::get($overrides, 'isCorrectedResult', false) === true) {
+            $overrides['data'] = $overrides;
+            $overrides['queueType'] = 'ARTGEN';
+            parent::spawn($jobClass, $overrides);
+
+            return;
+        }
+
+        $nextJobClass = null;
+        $nextJobs = $this->getNextJobsInWorkflow($overrides['orderId'], $jobClass);
+
+        foreach ($nextJobs as $nextJob) {
+
+            if (empty($nextJob['nextJobType'])) {
+                continue;
+            }
+            if ($nextJob['nextJobType'] == 'callback') {
+                $classObj = app($nextJob['class']);
+
+                $results = call_user_func([$classObj, $nextJob['method']], $overrides, $this->model->getMasterOrder($overrides['orderId']));
+
+                if ($results === null) {
+                    // We didn't get any result back from the method, so continue to the next anchor in the loop
+                    continue;
+                }
+
+                $nextJobClass = $results['job'];
+                $overrides['queueType'] = $results['queue'];
+
+                $data = array_exists('data', $results, []);
+                $overridesData = array_exists('data', $overrides, []);
+
+                $overrides['data'] = array_merge($overridesData, $data);
+            } elseif ($nextJob['nextJobType'] == 'direct') {
+                $nextJobClass = $nextJob['nextJob'];
+                $overrides['queueType'] = $nextJob['queue'];
+            }
+
+            if (isset($nextJob['inputConfig']) && $nextJob['inputConfig']) {
+                $inputConfig = Json::decode($nextJob['inputConfig']);
+                $overridesData = array_exists('data', $overrides, []);
+                $overrides['data'] = array_merge($overridesData, $inputConfig);
+            }
+
+            if (isset($nextJob['configuredWorkflowInput']) && $nextJob['configuredWorkflowInput']) {
+                $configuredWorkflowInput = Json::decode($nextJob['configuredWorkflowInput']);
+                $overridesData = array_exists('data', $overrides, []);
+                $overrides['data'] = array_merge($overridesData, $configuredWorkflowInput);
+            }
+
+            // Spawn the new job
+            parent::spawn($nextJobClass, $overrides);
+        }
+
+        // TODO Check if we should look to do an EOST Notification, check OrderJobSpawnerV2
+    }
+
+    public function getNextJobsInWorkflow(int $orderId, string $jobClass): mixed
+    {
+        $order = Order::find($orderId);
+        if (!$order) {
+            Log::error("Order not found for ID: " . $orderId);
+            return [];
+        }
+
+        $workflowConfig = $order->productDefinition->workflow_config;
+
+        if ($workflowConfig && array_key_exists($jobClass, $workflowConfig)) {
+            $nextJobConfig = $workflowConfig[$jobClass];
+
+            if (is_array($nextJobConfig) && array_key_exists(0, $nextJobConfig)) {
+                return $nextJobConfig;
+            } else {
+                return [$nextJobConfig];
+            }
+        }
+
+        return [];
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Models\Master\Gid\MasterGidCondition;
+use App\Models\Master\SourceSystem;
+use App\Models\Order\Order;
+use App\Models\Product\ProductDefinitions;
+use App\QWorker\JobModel\Request\Request;
+use App\QWorker\Order\Order as QWorkerOrder;
+use App\Repositories\V4\Order\OrderRepository;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Exception;
+
+class OrderPublishJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected $orderRepository;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_WIP_PUBLISH';
+
+    /**
+     * Constructor to initialize job with payload
+     *
+     * @param  array  $payload  Job input data
+     */
+    public function __construct(array $payload)
+    {
+        $this->payload = $payload;
+        $this->orderRepository = app(OrderRepository::class);
+    }
+
+    /**
+     * Handle method that gets executed when job is processed
+     */
+    public function handle(): void
+    {
+        DB::beginTransaction();
+        try {
+            $payload = $this->payload;
+            $orderId = (int) $this->job->getOrderId();
+            $order = Order::with(['productDefinition', 'tests'])->findOrFail($orderId);
+
+            $testCodeXref = $order->tests->first()->test_code_xref ?? null;
+            if ($testCodeXref) {
+                $testCodeXref = str_replace('%', '', $testCodeXref);
+                $productDefinition = ProductDefinitions::where('test_code_xref', $testCodeXref)->first();
+                if (!$productDefinition) {
+                    throw new Exception("Product definition not found for test_code_xref: $testCodeXref");
+                }
+            } else {
+                $productDefinition = $order->productDefinition;
+            }
+
+            if (!$productDefinition || !$productDefinition->config_data) {
+                throw new Exception('Missing config_data in product definition.');
+            }
+
+            $endpointRouting = $productDefinition->config_data;
+            $publishConfig = $endpointRouting['PublishToTechnical'] ?? [];
+
+            if (empty($publishConfig)) {
+                throw new Exception('Missing releaseToTechnical publish config.');
+            }
+
+            if (!empty($publishConfig['conditionsToSetOnSuccess'])) {
+                $validations = [
+                    'conditions' => [
+                        'notPresent' => $publishConfig['conditionsToSetOnSuccess'],
+                    ],
+                ];
+                $this->validateOrder($orderId, $validations);
+            }
+
+            $interfaceUdid = $publishConfig['interfaceUdid'];
+            $eventUdid = $publishConfig['eventUdid'];
+            $includes = $publishConfig['includes'] ?? [];
+            $expectedResponseCode = $publishConfig['outboundInterfaceExpectedResponse'] ?? 201;
+            $docType = $payload['docType'] ?? 'ORDER_EVENT_PUBLISH';
+
+            $uri = app(QWorkerOrder::class)->getInterfaceEndpoint($interfaceUdid, $eventUdid);
+            $authorization = app(Request::class)->getServiceAuthorization($interfaceUdid);
+            $apiPayload = $this->assembleOrderPublishPayloadFromFilters($orderId, $includes, $docType, $order->productDefinition->test_code);
+
+            if (isset($payload['triggeringEventId'])) {
+                $apiPayload['triggeringEvent'] = $this->getTriggeringEventData($orderId, $payload['triggeringEventId'], $eventUdid);
+            }
+
+            $response = app(Request::class)->callOutboundApiRequest(
+                $uri,
+                [$authorization['headerKey'] . ': ' . $authorization['token']],
+                $apiPayload,
+                $authorization['systemUserApiCredentialId']
+            );
+
+            if ($response['responseStatusCode'] !== $expectedResponseCode) {
+                throw new Exception('Unexpected response code: ' . $response['responseStatusCode']);
+            }
+
+            $sourceSystemUdid = $order->detail['meta']['sourceSystemUdid'] ?? null;
+            $sourceSystem = SourceSystem::where('udid', $sourceSystemUdid)->first();
+
+            if (!$sourceSystem) {
+                throw new Exception("Invalid source system UDID: $sourceSystemUdid");
+            }
+
+            $eventService = app(EventService::class);
+            $testCodes = $this->orderRepository->getTestCode($order);
+            $orderEvent = $eventService->storeOrderEvent(
+                $order,
+                $eventUdid,
+                $sourceSystem->udid,
+                $response['apiRequestId'],
+                $this->job->getLogId(),
+                $response['apiRequestId'],
+                $testCodes
+            );
+
+            foreach ($publishConfig['conditionsToSetOnSuccess'] ?? [] as $conditionCode) {
+                $condition = MasterGidCondition::where('udid', $conditionCode)->first();
+
+                if (!$condition) {
+                    throw new Exception("Condition code not found: $conditionCode");
+                }
+
+                $order->conditions()->create([
+                    'gid_condition_id' => $condition->gid_condition_id,
+                ]);
+
+                $order->conditionHistory()->create([
+                    'gid_condition_id' => $condition->gid_condition_id,
+                    'order_event_id' => $orderEvent->order_event_id,
+                ]);
+            }
+
+            DB::commit();
+        } catch (Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    /**
+     * Validates condition codes on the order
+     *
+     * @throws Exception
+     */
+    protected function validateOrder(int $orderId, array $validations): void
+    {
+        $problems = [];
+        $conditions = $this->orderRepository->getOrderConditions($orderId);
+
+        if (isset($validations['conditions']['present'])) {
+            foreach ($validations['conditions']['present'] as $code) {
+                if (!array_key_exists($code, $conditions)) {
+                    $problems['conditionsThatShouldBePresent'][] = $code;
+                }
+            }
+        }
+
+        if (isset($validations['conditions']['notPresent'])) {
+            foreach ($validations['conditions']['notPresent'] as $code) {
+                if (array_key_exists($code, $conditions)) {
+                    $problems['conditionsThatShouldNotBePresent'][] = $code;
+                }
+            }
+        }
+
+        if (!empty($problems)) {
+            throw new Exception('Validation failed: ' . json_encode($problems));
+        }
+    }
+
+    /**
+     * Assemble outbound order payload based on includes
+     */
+    public function assembleOrderPublishPayloadFromFilters(
+        int $orderId,
+        array $includes,
+        string $docType = 'ORDER_DATA_PUBLISH',
+        string $testCode
+    ): array {
+        $clientData = $this->orderRepository->getClientData($orderId);
+        $patientData = $this->orderRepository->getPatientData($orderId);
+        if ($this->isProfileTest($testCode)) {
+            return $this->getProfilePayload($orderId, $clientData, $patientData);
+        }
+
+        if ($testCode === 'T1050') {
+            return $this->getMonitoringPayload($orderId, $clientData, $patientData);
+        }
+
+        $orderData = $this->orderRepository->getOrder($orderId);
+        $accessionNumber = $this->extractAccessionNumber($orderData->adid);
+        $createdDate = Carbon::parse($orderData->created)->utc()->format('Y-m-d\TH:i:s.u\Z');
+        $sourceSystemUdid = $this->orderRepository->getsourceSystemUdid($orderId);
+
+        return [
+            'header' => [
+                'createdOn' => Carbon::now()->toJSON(),
+                'docType' => $docType,
+                'docTypeVersion' => '1.0.0',
+            ],
+            'order' => [
+                'orderAdid' => $orderData->adid,
+                'AccessionNumber' => $accessionNumber,
+                'RequisitionNumber' => '',
+                'TestCode' => $orderData->test_code,
+                'Testname' => $orderData->test_name,
+                'AccessionDate' => $createdDate,
+            ],
+            'sourceSystem' => [
+                'udid' => $sourceSystemUdid,
+                'nomenclature' => $this->orderRepository->getNomenclture($sourceSystemUdid),
+            ],
+            'client' => $this->orderRepository->getClientData($orderId),
+            'patient' => $this->orderRepository->getPatientData($orderId),
+            'samples' => [$this->orderRepository->getSamples($orderId)],
+        ];
+    }
+
+    private function extractAccessionNumber(string $adid): string
+    {
+        return last(explode('.', $adid));
+    }
+
+    private function isProfileTest(string $testCode): bool
+    {
+        return in_array($testCode, ['PR1030', 'T1030', 'T1040'], true);
+    }
+
+    public function getMonitoringPayload(int $orderId, $clientData, $patientData)
+    {
+        $orderData = $this->orderRepository->getOrder($orderId);
+        $accessionNumber = explode('.', $orderData->adid);
+        $accessionNumber = end($accessionNumber);
+        $copy = Carbon::parse($orderData->created)->copy();
+        return [
+            'mpdd' => [
+                [
+                    'data' => [
+                        [
+                            'value' => $orderData->root_id,
+                            'typeUdid' => 'UDF_ORDER',
+                            'absUdidPath' => 'T1050/UDFX10003',
+                            'valueSource' => 'EVX',
+                            'nomenclature' => 'Root ID',
+                            'valueDataType' => 'STRING'
+                        ]
+                    ],
+                    'udid' => 'T1050',
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'revisionOn' => '2025-07-25T08:19:57.000000Z',
+                    'nomenclature' => 'Haystack Monitoring Test',
+                    'provenanceTypeUdid' => null
+                ]
+            ],
+            'order' => [
+                'orderAdid' => $orderData->adid,
+                'sourceXrefId' => $accessionNumber,
+                'labReferenceId' => null,
+                'sourceCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'systemCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'referralOriginOrderAdid' => null,
+                'referralParentOrderAdid' => null
+            ],
+            'client' => [
+                'phone' => $clientData['clientPhone'],
+                'xrefId' => $clientData['clientId'],
+                'address' => [
+                    'ln1' => $clientData['clientAddressStreetLN1'],
+                    'ln2' => null,
+                    'locale' => $clientData['clientAddressLocality'],
+                    'postal' => $clientData['clientAddressPostal'],
+                    'region' => $clientData['clientAddressRegion'],
+                    'country' => $clientData['clientAddressCountry']
+                ],
+                'nomenclature' => $clientData['clientName'],
+            ],
+            'header' => [
+                'docType' => 'ORDER_EVENT_PUBLISH',
+                'createdOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'docTypeVersion' => '1.0.0'
+            ],
+            'patient' => [
+                'dob' => $patientData['patientDOB'],
+                'sex' => $patientData['patientSex'],
+                'surname' => $patientData['patientSurname'],
+                'givenName' => $patientData['patientGivenName'],
+                'qdpIdXrefId' => null,
+                'qdpNumXrefId' => $patientData['qdpnum'],
+                'medicalRecordXrefId' => null,
+                'externalPatientXrefId' => null
+            ],
+            'samples' => $this->formatSamples($this->orderRepository->getSamples($orderId)),
+            'provider' => $this->orderRepository->getProviderData($orderId),
+            'orderedTests' => [
+                [
+                    'udid' => 'T1050',
+                    'aliases' => [
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC1',
+                            'aliasValue' => '13151Z3E=',
+                            'nomenclature' => 'Mnemonic, first internal for Haystack Monitoring',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151'
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC2',
+                            'aliasValue' => '13151Z3E',
+                            'nomenclature' => 'Mnemonic, second internal for Haystack Monitoring',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151'
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC3',
+                            'aliasValue' => 'Z1113151',
+                            'nomenclature' => 'Mnemonic, third internal for Haystack Monitoring',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151'
+                        ],
+                        [
+                            'typeUdid' => '99QDI',
+                            'aliasValue' => '13151',
+                            'nomenclature' => 'HAYSTACK MRD(TM) MONITORING',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151'
+                        ]
+                    ],
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'parentUdid' => null,
+                    'revisionOn' => '2025-07-25T08:19:57.000000Z',
+                    'nomenclature' => 'Haystack Monitoring Test',
+                    '_offeringItemId' => 863,
+                    'parentNomenclature' => null
+                ]
+            ],
+            'sourceSystem' => [
+                'udid' => 'UNE',
+                'nomenclature' => 'QLS, New England Upgrade'
+            ]
+        ];
+    }
+
+    public function getProfilePayload(int $orderId, $clientData, $patientData)
+    {
+        $orderData = $this->orderRepository->getOrder($orderId);
+        $accessionNumber = explode('.', $orderData->adid);
+        $accessionNumber = end($accessionNumber);
+        $copy = Carbon::parse($orderData->created)->copy();
+        return [
+            'mpdd' => [
+                [
+                    'data' => [
+                        [
+                            'value' => $orderData->root_id,
+                            'typeUdid' => 'UDF_ORDER',
+                            'absUdidPath' => 'PR1030/UDFX10003',
+                            'valueSource' => 'EVX',
+                            'nomenclature' => 'Root ID',
+                            'valueDataType' => 'STRING'
+                        ]
+                    ],
+                    'udid' => 'PR1030/T1030',
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'revisionOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                    'nomenclature' => 'Haystack Personalization Test',
+                    'provenanceTypeUdid' => null
+                ],
+                [
+                    'data' => [
+                        [
+                            'value' => $orderData->adid,
+                            'typeUdid' => 'UDF_ORDER',
+                            'absUdidPath' => 'PR1030/UDFX10003',
+                            'valueSource' => 'EVX',
+                            'nomenclature' => 'Root ID',
+                            'valueDataType' => 'STRING'
+                        ]
+                    ],
+                    'udid' => 'PR1030/T1040',
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'revisionOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                    'nomenclature' => 'Haystack Baseline Test',
+                    'provenanceTypeUdid' => null
+                ]
+            ],
+            'order' => [
+                'orderAdid' => $orderData->adid,
+                'sourceXrefId' => $accessionNumber,
+                'labReferenceId' => null,
+                'sourceCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'systemCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'referralOriginOrderAdid' => null,
+                'referralParentOrderAdid' => null
+            ],
+            'client' => [
+                'phone' => $clientData['clientPhone'],
+                'xrefId' => $clientData['clientId'],
+                'address' => [
+                    'ln1' => $clientData['clientAddressStreetLN1'],
+                    'ln2' => null,
+                    'locale' => $clientData['clientAddressLocality'],
+                    'postal' => $clientData['clientAddressPostal'],
+                    'region' => $clientData['clientAddressRegion'],
+                    'country' => $clientData['clientAddressCountry']
+                ],
+                'nomenclature' => $clientData['clientName'],
+            ],
+            'header' => [
+                'docType' => 'ORDER_EVENT_PUBLISH',
+                'createdOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'docTypeVersion' => '1.0.0'
+            ],
+            'patient' => [
+                'dob' => $patientData['patientDOB'],
+                'sex' => $patientData['patientSex'],
+                'surname' => $patientData['patientSurname'],
+                'givenName' => $patientData['patientGivenName'],
+                'qdpIdXrefId' => null,
+                'qdpNumXrefId' => $patientData['qdpnum'],
+                'medicalRecordXrefId' => null,
+                'externalPatientXrefId' => null
+            ],
+            'samples' => $this->formatSamples($this->orderRepository->getSamples($orderId)),
+            'provider' => $this->orderRepository->getProviderData($orderId),
+            'orderedTests' => [
+                [
+                    'udid' => 'PR1030/T1030',
+                    'aliases' => [
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC1',
+                            'aliasValue' => '13128Z3E=',
+                            'nomenclature' => 'Mnemonic, first internal for Haystack Personalization',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030'
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC2',
+                            'aliasValue' => '13128Z3E',
+                            'nomenclature' => 'Mnemonic, second internal for Haystack Personalization',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030'
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC3',
+                            'aliasValue' => 'Z1113128',
+                            'nomenclature' => 'Mnemonic, third internal for Haystack Personalization',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030'
+                        ],
+                        [
+                            'typeUdid' => '99QDI',
+                            'aliasValue' => '13128',
+                            'nomenclature' => 'HAYSTACK MRD(TM) PERSONALIZATION',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030'
+                        ]
+                    ],
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'parentUdid' => 'PR1030',
+                    'revisionOn' => '2025-07-25T08:19:33.000000Z',
+                    'nomenclature' => 'Haystack Personalization Test',
+                    '_offeringItemId' => 738,
+                    'parentNomenclature' => 'Haystack Profile Test'
+                ],
+                [
+                    'udid' => 'PR1030/T1040',
+                    'aliases' => [
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC1',
+                            'aliasValue' => '13144Z3E=',
+                            'nomenclature' => 'Mnemonic, first internal for Haystack Baseline',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040'
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC2',
+                            'aliasValue' => '13144Z3E',
+                            'nomenclature' => 'Mnemonic, second internal for Haystack Baseline',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040'
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC3',
+                            'aliasValue' => 'Z1113144',
+                            'nomenclature' => 'Mnemonic, third internal for Haystack Baseline',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040'
+                        ],
+                        [
+                            'typeUdid' => '99QDI',
+                            'aliasValue' => '13144',
+                            'nomenclature' => 'HAYSTACK MRD(TM) BASELINE',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040'
+                        ]
+                    ],
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'parentUdid' => 'PR1030',
+                    'revisionOn' => '2025-07-25T08:19:33.000000Z',
+                    'nomenclature' => 'Haystack Baseline Test',
+                    '_offeringItemId' => 775,
+                    'parentNomenclature' => 'Haystack Profile Test'
+                ]
+            ],
+            'sourceSystem' => [
+                'udid' => 'UNE',
+                'nomenclature' => 'QLS, New England Upgrade'
+            ]
+        ];
+    }
+
+    private function formatSamples(Collection $samples): array
+    {
+        return $samples->map(function ($sample) {
+            return [
+                'type' => [
+                    'udid' => 'O',  // Hardcoded as per your example; make dynamic if needed
+                    'nomenclature' => 'Other'
+                ],
+                'xrefId' => $sample->sourceSystemXref,
+                'workscope' => [
+                    'PR1030.1',
+                    'T1030.1',
+                    'T1040.1'
+                ],
+                'collectedOn' => Carbon::parse($sample->collectionDatetime)->utc()->format('Y-m-d\TH:i:s.u\Z'),
+            ];
+        })->toArray();
+    }
+
+    /**
+     * Returns the triggering event block for API payload
+     */
+    protected function getTriggeringEventData(int $orderId, string $triggeringEventId, string $eventUdid): array
+    {
+        return [
+            'triggeringEventId' => $triggeringEventId,
+            'orderId' => $orderId,
+            'eventUdid' => $eventUdid,
+        ];
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\RuntimeException;
+use App\Http\Services\V4\EventService;
+use App\Jobs\Util\Json;
+use App\Models\Master\Gid\MasterGidCondition;
+use App\Models\Order\Order;
+use App\Models\Order\Test;
+use App\Models\Order\OrderEvent;
+use App\QWorker\JobModel\ApiModel;
+use App\Repositories\V4\Order\OrderResultDeliveryRepository;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+class OrderResultDeliveryConfirmationJobV4 implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    const RESULT_DELIVERED_EVENT = 'RESULT_DELIVERED';
+
+    const RESULT_CONFIRMED_CONDITION = 'RESULT_CONFIRMED'; // Must be a valid UDID in gid_conditions
+
+    protected $api;
+
+    public function __construct(
+        protected array $payload,
+    ) {
+        $this->payload = $payload;
+    }
+
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $this->api = app()->make(ApiModel::class);
+            $jobId = (int) $this->job->getJobId();
+            $apiRequestId = $this->payload['apiRequestId'];
+            $apiPayload = $this->getMessage($apiRequestId);
+            $messageIndex = $this->payload['messageIndex'] ?? 0;
+            $dataIndex = $this->payload['dataIndex'] ?? 0;
+            $message = $apiPayload['messages'][$messageIndex];
+            $orderData = $message['payload']['data'][$dataIndex]['order'] ?? null;
+            $orderAdid = $orderData['orderAdid'] ?? null;
+            $order = Order::where('adid', $orderAdid)->first();
+            $test = Test::where('order_id', $order->order_id)->first();
+            if (in_array($test->test_code, ['T1030', 'T1040', 'T1050', 'PR1030'])) {
+                $deliveryRepo = app(OrderResultDeliveryRepository::class);
+                $resultReportPayloadId = $deliveryRepo->getResultReportPayloadIdFromOrderIDAndDigest([
+                    'order_id' => $order->order_id,
+                    'result_transform_adid' => $orderData['resultTransformAdid'] ?? '',
+                ]);
+                if (! $resultReportPayloadId) {
+                    throw new RuntimeException(
+                        'resultTransformAdid [%s] not found for orderAdid [%s]',
+                        $orderData['resultTransformAdid'] ?? '',
+                        $orderData['orderAdid'] ?? ''
+                    );
+                }
+            }
+            if (! $order) {
+                Log::error('Order not found for result delivery confirmation', ['orderAdid' => $orderAdid]);
+                throw new RuntimeException('Order not found for result delivery confirmatiom orderAdid ' . $orderAdid);
+            }
+            $sourceSystemUdid = $order->detail['meta']['sourceSystemUdid'] ?? null;
+            $dataArray = $message['payload']['data'] ?? [];
+            $allDeliveredTransforms = [];
+            foreach ($dataArray as $dataItem) {
+                $orderTransforms = $dataItem['order'] ?? [];
+                $deliveredTransforms = $orderTransforms['deliveredTransforms'] ?? [];
+                $allDeliveredTransforms[] = $deliveredTransforms;
+            }
+            $flattenedTransforms = array_merge(...$allDeliveredTransforms);
+            $meta = json_encode($flattenedTransforms);
+            $conditionId = $this->getConditionId('RDCF');
+            $this->createCondition($order, $conditionId);
+            $eventService = app(EventService::class);
+            $orderEvent = $eventService->storeOrderEvent(
+                $order,
+                $message['payload']['event']['udid'],
+                $sourceSystemUdid,
+                $apiRequestId,
+                $jobId,
+                0,
+                null,
+                $meta
+            );
+            $this->createOrderConditionHistory($order, $orderEvent, $conditionId);
+            DB::commit();
+        } catch (Throwable $e) {
+            // Rollback transaction if an error occurs
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            // Log the error and fail the job
+            Log::error('OrderResultDeliveryConfirmationJobV4 failed', [
+                'exception' => $e,
+                'payload' => $this->payload,
+            ]);
+
+            throw $e;
+        }
+    }
+
+    private function getConditionId(string $conditionCode): int
+    {
+        $condition = MasterGidCondition::where('udid', $conditionCode)->first();
+
+        if (! $condition) {
+            Log::error('Invalid condition UDID', ['udid' => $conditionCode]);
+            throw new RuntimeException("Invalid condition UDID: $conditionCode");
+        }
+
+        return $condition->gid_condition_id;
+    }
+
+    private function createCondition(Order $order, int $conditionId): void
+    {
+        $order->conditions()->create([
+            'gid_condition_id' => $conditionId,
+        ]);
+    }
+
+    private function createOrderConditionHistory(Order $order, OrderEvent $event, int $conditionId): void
+    {
+        $order->conditionHistory()->create([
+            'gid_condition_id' => $conditionId,
+            'order_event_id' => $event->order_event_id,
+        ]);
+    }
+
+    protected function getMessage(int $apiRequestId): array
+    {
+        return Json::decode($this->api->getInboundRequest($apiRequestId));
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Http\Services\V4\OrderService;
+use App\Http\Services\V4\ReportService;
+use App\Models\Order\OrderEvent;
+use App\Models\Order\OrderReport;
+use App\Repositories\V4\Order\OrderRepository;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+
+class OrderResultTransformsJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $order = null;
+
+    protected $orderEvent = null;
+
+    protected $orderService = null;
+
+    protected $eventService = null;
+
+    protected $reportService = null;
+
+    protected $attributes = [];
+
+    /**
+     * @var OrderRepository Handles database interaction with order conditions
+     */
+    protected OrderRepository $orderRepository;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_RESULT_GENERATE';
+
+    /**
+     * Create a new job instance.
+     */
+    public function __construct(
+        private $payload
+    ) {
+
+        $this->payload = $payload;
+        $this->orderRepository = app(OrderRepository::class);
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        $orderId = $this->payload['orderId'];
+        $this->orderService = app()->make(OrderService::class);
+        $this->reportService = app()->make(ReportService::class);
+        $this->eventService = app()->make(EventService::class);
+        $this->order = $this->orderService->getOrderById($orderId);
+
+        try {
+            DB::beginTransaction();
+
+            $this->initialize();
+
+            if ($this->payload['report_id']) {
+                $orderReport = OrderReport::where('report_id', $this->payload['report_id'])->first();
+            } else {
+                $orderReport = $this->createOrderReport();
+            }
+
+            $generatorConfigs = $this->getGeneratorConfig();
+            foreach ($generatorConfigs as $generatorConfig) {
+                $generatorClass = $generatorConfig['className'] ?? null;
+                $generator = new $generatorClass;
+                $generator->initialize($orderReport, $this->payload, $this->attributes);
+
+                // TODO implement generate for each generator
+                $message = $generator->generate();
+                $generator->store([
+                    'value' => $message,
+                    'source_system_id' => $this->eventService->getSourceSystemByUdid($this->payload['sourceSystemUdid'])->source_system_id,
+                ]);
+            }
+            $this->payload['report_id']=$orderReport->report_id;
+            $orderJobSpawner = app(OrderJobSpawnerV4::class);
+            $orderJobSpawner->spawn(get_class($this), [
+                'orderId' => $this->order->order_id,
+                'data' => $this->payload,
+            ]);
+
+            DB::commit();
+        } catch (\Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            // Use the CustomJobException
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    private function createOrderReport(): OrderReport
+    {
+        $data = [
+            'test_code' => $this->payload['test_code'],
+            'report_status_udid' => $this->payload['rptStatusUdid'],
+            'order_event_id' => $this->orderEvent->order_event_id ?? 0,
+            'created_at' => now(),
+            'reported_on' => $this->payload['reportedOn'] ?? now(),
+            'meta' => $this->payload['meta'] ?? [],
+        ];
+
+        return $this->reportService->createOrderReport($this->order, $data);
+    }
+
+    private function initialize(): void
+    {
+        $this->validateOrder();
+
+        $this->orderEvent = $this->createEvent();
+
+        $this->createCondition();
+
+        // TODO handle ARCO condition
+    }
+
+    protected function validateOrder(): void
+    {
+        if ($this->orderService->orderHasCondition($this->order, 'RLOCK')) {
+            // throw new Exception('Order results are locked');
+        }
+
+        if ($this->orderService->orderHasCondition($this->order, 'WIPH')) {
+            throw new \Exception(
+                'Order updates not permitted. Order is currently on WIP HOLD, '
+                .'contact operations to release for processing.'
+            );
+        }
+    }
+
+    /**
+     * The product definition may contain report generator configurations.
+     * "report_generators": [
+     *      {
+     *       "className": "App\\Jobs\\ReportGenerators\\HL7Generator",
+     *      "skipOnConditionCodes": []
+     *      },
+     *      // more
+     *  ]
+     *
+     * @TODO Handling an order with unrelated tests where the tests have different report generators.
+     */
+    private function getGeneratorConfig(): array
+    {
+        $productDefinition = $this->order->productDefinition;
+
+        if (! $productDefinition && ! isset($productDefinition->report_generators)) {
+            return [];
+        }
+        $generators = $productDefinition->report_generators;
+
+        // Ensure LISAsciiGenerator runs first as ASCII report is needed for HL7 report
+        $lisAsciiGenerators = array_filter($generators, function ($generator) {
+            return str_contains($generator['className'] ?? '', 'LISAsciiGenerator');
+        });
+
+        $otherGenerators = array_filter($generators, function ($generator) {
+            return ! str_contains($generator['className'] ?? '', 'LISAsciiGenerator');
+        });
+
+        return array_merge($lisAsciiGenerators, $otherGenerators);
+    }
+
+    private function createCondition(): void
+    {
+        if ($this->isFinalResult()) {
+            $gidCondition = $this->orderService->getCondition('RLOCK');
+            $gidConditionId = $gidCondition->gid_condition_id;
+
+            $this->order->conditions()->create([
+                'gid_condition_id' => $gidConditionId,
+            ]);
+
+            $this->createOrderConditionHistory($gidConditionId);
+        }
+    }
+
+    private function createOrderConditionHistory(int $gidConditionId): void
+    {
+        $orderConditionHistory = $this->order->conditionHistory()->create([
+            'gid_condition_id' => $gidConditionId,
+            'order_event_id' => $this->orderEvent->order_event_id,
+        ]);
+        $this->attributes['orderConditionHistoryId'] = $orderConditionHistory->order_condition_history_id;
+    }
+
+    private function isFinalResult(): bool
+    {
+        return $this->payload['rptStatusUdid'] === 'FINAL';
+    }
+
+    private function createEvent(): OrderEvent
+    {
+        $inboundApiRequestId = $this->payload['apiRequestId'];
+        $eventUdid = $this->payload['eventUdid'];
+        $jobId = isset($this->payload['job_id']) ? (int) $this->payload['job_id'] : (int) $this->job->getLogId();
+        $testCodes = $this->payload['test_code'];
+
+        // TODO post_on should be saved, different from created_at
+        return $this->eventService->storeOrderEvent(
+            $this->order,
+            $eventUdid,
+            $this->payload['sourceSystemUdid'],
+            $inboundApiRequestId,
+            $jobId,
+            0,
+            $testCodes
+        );
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Models\Order\Order;
+use App\QWorker\JobModel\Request\Request;
+use App\QWorker\JobModel\System\SystemEventModel;
+use App\QWorker\Order\Order as QWorkerOrder;
+use App\Repositories\V4\Order\OrderRepository;
+use App\Repositories\V4\Sample\TestRepository;
+use App\Repositories\V4\System\SourceSystemRepository;
+use Exception;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+
+class OrderUpdateJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected $orderRepository = null;
+
+    protected $testRepository = null;
+
+    protected $sourceSystemRepository = null;
+
+    protected $orderObj = null;
+
+    protected $orderJobSpawner = null;
+
+    protected $eventModel = null;
+
+    protected $eventService = null;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_EVENT_CONSUME';
+
+    public function __construct(array $payload)
+    {
+        $this->payload = $payload;
+        $this->orderRepository = app()->make(OrderRepository::class);
+        $this->sourceSystemRepository = app()->make(SourceSystemRepository::class);
+        $this->testRepository = app()->make(TestRepository::class);
+        $this->eventModel = app(SystemEventModel::class);
+        $this->orderJobSpawner = app()->make(OrderJobSpawnerV4::class);
+        $this->orderObj = app()->make(QWorkerOrder::class);
+        $this->eventService = app()->make(EventService::class);
+    }
+
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $payload = $this->payload;
+            $orderId = $this->job->getOrderId();
+            $jobId = $this->job->getLogId();
+
+            $orderDetail = $this->orderRepository->getOrder($orderId);
+            $testCodes = $this->orderRepository->getTestCode($orderDetail);
+            $testCodes = ! empty($testCodes) ? explode(',', $testCodes)[0] : '';
+            $this->eventService->storeOrderEvent(
+                $orderDetail,
+                $payload['eventUdid'],
+                $orderDetail->detail['meta']['sourceSystemUdid'],
+                $payload['apiRequestId'],
+                $jobId,
+                0,
+                $testCodes
+            );
+
+            if ($this->shouldSendPatientUpdate($payload['newPatientData'])) {
+                $this->sendPatientUpdateToExternalSystem($payload);
+            }
+
+            if ($this->shouldUpdateReport($payload)) {
+                $reportStatus = $this->orderRepository->getReportStatusByOrderId($orderId);
+                if ($reportStatus) {
+                    $summary = $this->generateSummaryOfChanges($payload);
+                    $orderedTest = $payload['testXref'] === 'PR1030'
+                        ? ($reportStatus['udid'] === 'PRELIM' ? 'T1030' : 'T1040')
+                        : $payload['testXref'];
+                    $this->dispatchCorrectionEvent($orderId, $payload, $summary, $orderedTest);
+                }
+            }
+
+            DB::commit();
+        } catch (Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    private function shouldSendPatientUpdate(array $newPatientData): bool
+    {
+        return isset($newPatientData['patientDOB']) ||
+            isset($newPatientData['patientGivenName']) ||
+            isset($newPatientData['patientSurname']);
+    }
+
+    private function shouldUpdateReport(array $payload): bool
+    {
+        return $this->shouldSendPatientUpdate($payload['newPatientData']) ||
+            isset($payload['newPatientData']['patientInitials']) ||
+            ! empty($payload['newClientData']);
+    }
+
+    private function sendPatientUpdateToExternalSystem(array $payload): void
+    {
+        $request = app()->make(Request::class);
+        $uri = $this->orderObj->getInterfaceEndpoint($payload['interfaceUdid'], $payload['eventUdid']);
+
+        $authorization = $request->getServiceAuthorization($payload['interfaceUdid']);
+
+        $apiPayload = $this->assembleOrderPublishPayloadFromFilters($payload['orderId']);
+
+        $request->callOutboundApiRequest(
+            $uri,
+            [
+                $authorization['headerKey'].': '.$authorization['token'],
+                'SL-API-Method: Update',
+            ],
+            $apiPayload,
+            $authorization['systemUserApiCredentialId']
+        );
+    }
+
+    private function generateSummaryOfChanges(array $payload): ?string
+    {
+        $existing = $payload['existingPatientAndClientData'];
+        $newPatient = $payload['newPatientData'];
+        $newClient = $payload['newClientData'];
+
+        $changes = [];
+
+        $fields = [
+            'patientDob' => ['label' => 'date of birth', 'format' => true],
+            'patientGivenName' => ['label' => 'given name'],
+            'patientSurname' => ['label' => 'surname'],
+            'patientInitials' => ['label' => 'middlename', 'fallback' => 'blank'],
+            'clientSsidId' => ['label' => 'client id'],
+            'clientSsidDesc' => ['label' => 'client name'],
+        ];
+
+        foreach ($fields as $key => $meta) {
+            if (array_key_exists($key, $newPatient) || array_key_exists($key, $newClient)) {
+                $old = $existing[$key] ?? ($meta['fallback'] ?? '');
+                $new = $newPatient[$key] ?? $newClient[$key];
+                if (! empty($meta['format'])) {
+                    $old = date('m/d/Y', strtotime($old));
+                    $new = date('m/d/Y', strtotime($new));
+                }
+                $changes[] = "{$meta['label']} from $old to $new";
+            }
+        }
+
+        return ! empty($changes)
+            ? "This report is amended to change the patient's ".implode(', ', $changes).'.'
+            : null;
+    }
+
+    private function dispatchCorrectionEvent($orderId, $payload, $summary, $orderedTest): void
+    {
+        $payload = [
+            'eventUdid' => $payload['eventUdid'],
+            'rootMpcConfigId' => 0,
+            'reportStatus' => 'CORRECTED',
+            'summaryOfReportChanges' => $summary,
+            'orderedTest' => $orderedTest,
+            'apiRequestId' => $payload['apiRequestId'],
+            'orderId' => $orderId,
+
+        ];
+        $payload['data'] = $payload;
+
+        $this->orderJobSpawner->spawn(get_class($this), [
+            'orderId' => $orderId,
+            'data' => $payload,
+        ]);
+    }
+
+    public function assembleOrderPublishPayloadFromFilters(int $orderId, string $docType = 'ORDER_DATA_PUBLISH'): array
+    {
+        $orderData = $this->orderRepository->getOrder($orderId);
+        $accessionNumber = explode('.', $orderData->adid);
+        $accessionNumber = end($accessionNumber);
+
+        $copy = Carbon::parse($orderData->created)->copy();
+
+        $order = Order::with(['productDefinition', 'tests'])->findOrFail($orderId);
+        $clientData = $this->orderRepository->getClientData($orderId);
+        $patientData = $this->orderRepository->getPatientData($orderId);
+
+        if ($this->isProfileTest($order->productDefinition->test_code)) {
+            return $this->getProfilePayload($orderId, $clientData, $patientData);
+        }
+
+        if ($order->productDefinition->test_code === 'T1050') {
+            return $this->getMonitoringPayload($orderId, $clientData, $patientData);
+        }
+
+        return [
+            'header' => [
+                'createdOn' => Carbon::now()->toJSON(),
+                'docType' => $docType,
+                'docTypeVersion' => '1.0.0',
+            ],
+            'order' => [
+                'orderAdid' => $orderData->adid,
+                'AccessionNumber' => $accessionNumber,
+                'RequisitionNumber' => '',
+                'TestCode' => $orderData->test_code,
+                'Testname' => $orderData->test_name,
+                'AccessionDate' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+            ],
+            'sourceSystem' => [
+                'udid' => $orderData->detail['meta']['sourceSystemUdid'],
+                'nomenclature' => $this->sourceSystemRepository->getNomenclture($orderData->detail['meta']['sourceSystemUdid']),
+            ],
+            'client' => $orderData->detail['client'] ?? '',
+            'patient' => $orderData->detail['patient'] ?? '',
+            'samples' => [$this->testRepository->getSamples($orderId)],
+        ];
+    }
+
+    private function isProfileTest(string $testCode): bool
+    {
+        return in_array($testCode, ['PR1030', 'T1030', 'T1040'], true);
+    }
+
+    public function getProfilePayload(int $orderId, $clientData, $patientData)
+    {
+        $orderData = $this->orderRepository->getOrder($orderId);
+        $accessionNumber = explode('.', $orderData->adid);
+        $accessionNumber = end($accessionNumber);
+        $copy = Carbon::parse($orderData->created)->copy();
+
+        return [
+            'mpdd' => [
+                [
+                    'data' => [
+                        [
+                            'value' => $orderData->root_id,
+                            'typeUdid' => 'UDF_ORDER',
+                            'absUdidPath' => 'PR1030/UDFX10003',
+                            'valueSource' => 'EVX',
+                            'nomenclature' => 'Root ID',
+                            'valueDataType' => 'STRING',
+                        ],
+                    ],
+                    'udid' => 'PR1030/T1030',
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'revisionOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                    'nomenclature' => 'Haystack Personalization Test',
+                    'provenanceTypeUdid' => null,
+                ],
+                [
+                    'data' => [
+                        [
+                            'value' => $orderData->adid,
+                            'typeUdid' => 'UDF_ORDER',
+                            'absUdidPath' => 'PR1030/UDFX10003',
+                            'valueSource' => 'EVX',
+                            'nomenclature' => 'Root ID',
+                            'valueDataType' => 'STRING',
+                        ],
+                    ],
+                    'udid' => 'PR1030/T1040',
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'revisionOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                    'nomenclature' => 'Haystack Baseline Test',
+                    'provenanceTypeUdid' => null,
+                ],
+            ],
+            'order' => [
+                'orderAdid' => $orderData->adid,
+                'sourceXrefId' => $accessionNumber,
+                'labReferenceId' => null,
+                'sourceCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'systemCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'referralOriginOrderAdid' => null,
+                'referralParentOrderAdid' => null,
+            ],
+            'client' => [
+                'phone' => $clientData['clientPhone'],
+                'xrefId' => $clientData['clientId'],
+                'address' => [
+                    'ln1' => $clientData['clientAddressStreetLN1'],
+                    'ln2' => null,
+                    'locale' => $clientData['clientAddressLocality'],
+                    'postal' => $clientData['clientAddressPostal'],
+                    'region' => $clientData['clientAddressRegion'],
+                    'country' => $clientData['clientAddressCountry'],
+                ],
+                'nomenclature' => $clientData['clientName'],
+            ],
+            'header' => [
+                'docType' => 'ORDER_EVENT_PUBLISH',
+                'createdOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'docTypeVersion' => '1.0.0',
+            ],
+            'patient' => [
+                'dob' => $patientData['patientDOB'],
+                'sex' => $patientData['patientSex'],
+                'surname' => $patientData['patientSurname'],
+                'givenName' => $patientData['patientGivenName'],
+                'qdpIdXrefId' => null,
+                'qdpNumXrefId' => $patientData['qdpnum'],
+                'medicalRecordXrefId' => null,
+                'externalPatientXrefId' => null,
+            ],
+            'samples' => $this->formatSamples($this->orderRepository->getSamples($orderId)),
+            'provider' => $this->orderRepository->getProviderData($orderId),
+            'orderedTests' => [
+                [
+                    'udid' => 'PR1030/T1030',
+                    'aliases' => [
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC1',
+                            'aliasValue' => '13128Z3E=',
+                            'nomenclature' => 'Mnemonic, first internal for Haystack Personalization',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030',
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC2',
+                            'aliasValue' => '13128Z3E',
+                            'nomenclature' => 'Mnemonic, second internal for Haystack Personalization',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030',
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC3',
+                            'aliasValue' => 'Z1113128',
+                            'nomenclature' => 'Mnemonic, third internal for Haystack Personalization',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030',
+                        ],
+                        [
+                            'typeUdid' => '99QDI',
+                            'aliasValue' => '13128',
+                            'nomenclature' => 'HAYSTACK MRD(TM) PERSONALIZATION',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1030',
+                        ],
+                    ],
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'parentUdid' => 'PR1030',
+                    'revisionOn' => '2025-07-25T08:19:33.000000Z',
+                    'nomenclature' => 'Haystack Personalization Test',
+                    '_offeringItemId' => 738,
+                    'parentNomenclature' => 'Haystack Profile Test',
+                ],
+                [
+                    'udid' => 'PR1030/T1040',
+                    'aliases' => [
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC1',
+                            'aliasValue' => '13144Z3E=',
+                            'nomenclature' => 'Mnemonic, first internal for Haystack Baseline',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040',
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC2',
+                            'aliasValue' => '13144Z3E',
+                            'nomenclature' => 'Mnemonic, second internal for Haystack Baseline',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040',
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC3',
+                            'aliasValue' => 'Z1113144',
+                            'nomenclature' => 'Mnemonic, third internal for Haystack Baseline',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040',
+                        ],
+                        [
+                            'typeUdid' => '99QDI',
+                            'aliasValue' => '13144',
+                            'nomenclature' => 'HAYSTACK MRD(TM) BASELINE',
+                            'aliasRelatedType' => 'ANCHOR',
+                            'aliasRelatedUdid' => 'T1040',
+                        ],
+                    ],
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'parentUdid' => 'PR1030',
+                    'revisionOn' => '2025-07-25T08:19:33.000000Z',
+                    'nomenclature' => 'Haystack Baseline Test',
+                    '_offeringItemId' => 775,
+                    'parentNomenclature' => 'Haystack Profile Test',
+                ],
+            ],
+            'sourceSystem' => [
+                'udid' => 'UNE',
+                'nomenclature' => 'QLS, New England Upgrade',
+            ],
+        ];
+    }
+
+    private function formatSamples(Collection $samples): array
+    {
+        return $samples->map(function ($sample) {
+            return [
+                'type' => [
+                    'udid' => 'O',
+                    'nomenclature' => 'Other',
+                ],
+                'xrefId' => $sample->sourceSystemXref,
+                'workscope' => [
+                    'PR1030.1',
+                    'T1030.1',
+                    'T1040.1',
+                ],
+                'collectedOn' => Carbon::parse($sample->collectionDatetime)->utc()->format('Y-m-d\TH:i:s.u\Z'),
+            ];
+        })->toArray();
+    }
+
+    public function getMonitoringPayload(int $orderId, $clientData, $patientData)
+    {
+        $orderData = $this->orderRepository->getOrder($orderId);
+        $accessionNumber = explode('.', $orderData->adid);
+        $accessionNumber = end($accessionNumber);
+        $copy = Carbon::parse($orderData->created)->copy();
+
+        return [
+            'mpdd' => [
+                [
+                    'data' => [
+                        [
+                            'value' => $orderData->root_id,
+                            'typeUdid' => 'UDF_ORDER',
+                            'absUdidPath' => 'T1050/UDFX10003',
+                            'valueSource' => 'EVX',
+                            'nomenclature' => 'Root ID',
+                            'valueDataType' => 'STRING',
+                        ],
+                    ],
+                    'udid' => 'T1050',
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'revisionOn' => '2025-07-25T08:19:57.000000Z',
+                    'nomenclature' => 'Haystack Monitoring Test',
+                    'provenanceTypeUdid' => null,
+                ],
+            ],
+            'order' => [
+                'orderAdid' => $orderData->adid,
+                'sourceXrefId' => $accessionNumber,
+                'labReferenceId' => null,
+                'sourceCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'systemCreatedOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'referralOriginOrderAdid' => null,
+                'referralParentOrderAdid' => null,
+            ],
+            'client' => [
+                'phone' => $clientData['clientPhone'],
+                'xrefId' => $clientData['clientId'],
+                'address' => [
+                    'ln1' => $clientData['clientAddressStreetLN1'],
+                    'ln2' => null,
+                    'locale' => $clientData['clientAddressLocality'],
+                    'postal' => $clientData['clientAddressPostal'],
+                    'region' => $clientData['clientAddressRegion'],
+                    'country' => $clientData['clientAddressCountry'],
+                ],
+                'nomenclature' => $clientData['clientName'],
+            ],
+            'header' => [
+                'docType' => 'ORDER_EVENT_PUBLISH',
+                'createdOn' => $copy->utc()->format('Y-m-d\TH:i:s.u\Z'),
+                'docTypeVersion' => '1.0.0',
+            ],
+            'patient' => [
+                'dob' => $patientData['patientDOB'],
+                'sex' => $patientData['patientSex'],
+                'surname' => $patientData['patientSurname'],
+                'givenName' => $patientData['patientGivenName'],
+                'qdpIdXrefId' => null,
+                'qdpNumXrefId' => $patientData['qdpnum'],
+                'medicalRecordXrefId' => null,
+                'externalPatientXrefId' => null,
+            ],
+            'samples' => $this->formatSamples($this->orderRepository->getSamples($orderId)),
+            'provider' => $this->orderRepository->getProviderData($orderId),
+            'orderedTests' => [
+                [
+                    'udid' => 'T1050',
+                    'aliases' => [
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC1',
+                            'aliasValue' => '13151Z3E=',
+                            'nomenclature' => 'Mnemonic, first internal for Haystack Monitoring',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151',
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC2',
+                            'aliasValue' => '13151Z3E',
+                            'nomenclature' => 'Mnemonic, second internal for Haystack Monitoring',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151',
+                        ],
+                        [
+                            'typeUdid' => 'MNEMONIC_AIOC3',
+                            'aliasValue' => 'Z1113151',
+                            'nomenclature' => 'Mnemonic, third internal for Haystack Monitoring',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151',
+                        ],
+                        [
+                            'typeUdid' => '99QDI',
+                            'aliasValue' => '13151',
+                            'nomenclature' => 'HAYSTACK MRD(TM) MONITORING',
+                            'aliasRelatedType' => 'RELEASE',
+                            'aliasRelatedUdid' => '8700013151',
+                        ],
+                    ],
+                    'revision' => 1,
+                    'typeUdid' => 'TEST',
+                    'parentUdid' => null,
+                    'revisionOn' => '2025-07-25T08:19:57.000000Z',
+                    'nomenclature' => 'Haystack Monitoring Test',
+                    '_offeringItemId' => 863,
+                    'parentNomenclature' => null,
+                ],
+            ],
+            'sourceSystem' => [
+                'udid' => 'UNE',
+                'nomenclature' => 'QLS, New England Upgrade',
+            ],
+        ];
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Http\Services\V4\OrderService;
+use App\Models\Master\SourceSystem;
+use App\Models\Order\Order;
+use App\Repositories\Order\OrderRepository as V2OrderRepository;
+use App\Repositories\Order\OrderResultRepository;
+use App\Repositories\V4\Order\OrderRepository;
+use App\Repositories\V4\Order\ReportRepository;
+use App\Repositories\V4\Product\ProductRepository;
+use App\Repositories\V4\Test\TestRepository;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+
+class PostOrderInductionCheckJobV4 implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected $sourceSystemId = null;
+
+    protected TestRepository $testRepository;
+
+    protected OrderRepository $orderRepository;
+
+    protected ReportRepository $reportRepository;
+
+    protected OrderService $orderService;
+
+    protected ProductRepository $productRepository;
+
+    protected EventService $eventService;
+
+    const DEFAULT_EVENT_CONTEXT = 'POST_ORDER_INDUCTION_CHECK';
+
+    const EVENT_UDID = 'INB_ORD_POST_IND_CHECK';
+
+    public function __construct($payload)
+    {
+        $this->payload = $payload;
+
+        $this->testRepository = app(TestRepository::class);
+        $this->orderRepository = app(OrderRepository::class);
+        $this->reportRepository = app(ReportRepository::class);
+        $this->orderService = app(OrderService::class);
+        $this->productRepository = app(ProductRepository::class);
+        $this->eventService = app(EventService::class);
+    }
+
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+
+            $orderId = (int) $this->job->getOrderId();
+            $inboundApiRequestId = $this->payload['apiRequestId'];
+            $order = $this->orderRepository->getOrder($orderId);
+            $orderAdid = $order->adid;
+            $rootId = $order->root_id;
+            $testCount = $order->tests->count();
+            $failureReasons = [];
+
+            foreach ($order->tests as $test) {
+                $testCode = $this->productRepository->resolveTestCode($test);
+                $productDef = $this->productRepository->getProductDefinition($testCode);
+
+                if (! $productDef) {
+                    $failureReasons[] = "Missing product definition for test_code: {$testCode}.";
+
+                    continue;
+                }
+
+                if ($productDef->is_virtual) {
+                    continue;
+                }
+
+                $failureReasons = array_merge(
+                    $failureReasons,
+                    $this->validateTestConditions($testCode, $orderAdid, $rootId, $testCount)
+                );
+            }
+            $this->sourceSystemId = $this->orderRepository->getOrderSourceSystemId($orderId);
+            $jobId = (int) $this->job->getLogId();
+            $sourceSystem = SourceSystem::find($this->sourceSystemId);
+            $sourceSystemUdid = $sourceSystem->udid;
+            $testCodes = $this->orderRepository->getTestCode($order);
+            $testCodes = ! empty($testCodes) ? explode(',', $testCodes)[0] : '';
+            $event = $this->eventService->storeOrderEvent(
+                $order,
+                self::EVENT_UDID,
+                $sourceSystemUdid,
+                $inboundApiRequestId,
+                $jobId,
+                0,
+                $testCodes
+            );
+            if (empty($failureReasons)) {
+                $orderJobSpawner = app(OrderJobSpawnerV4::class);
+                $orderJobSpawner->spawn(get_class($this), [
+                    'orderId' => $orderId,
+                    'data' => [
+                        'apiRequestId' => $this->payload['apiRequestId'],
+                    ],
+                ]);
+            } else {
+                $this->eventService->setConditioCode($order, $event->order_event_id, 'WIPH');
+                $reasons = implode(', ', $failureReasons);
+                $this->orderRepository->addCommentsToEvents([
+                    'order_event_id' => $event->order_event_id,
+                    'systemComment' => "Post Order Induction Verification failed: $reasons",
+                    'systemCommentTime' => Carbon::now(),
+                ]);
+            }
+
+            DB::commit();
+        } catch (\Exception $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT
+            );
+            $this->fail($customException);
+        }
+    }
+
+    /**
+     * Validate test-specific data integrity rules.
+     *
+     * @return string[]
+     */
+    private function validateTestConditions(string $testCode, string $orderAdid, ?string $rootId, int $testCount): array
+    {
+        $reasons = [];
+
+        switch ($testCode) {
+            case 'PR1030':
+                if ($testCount !== 3) {
+                    $reasons[] = 'Test count must be 3 for test code PR1030.';
+                }
+                if ($rootId !== $orderAdid) {
+                    $reasons[] = 'Root ID must match the Order ADID for Haystack Profile (PR1030).';
+                }
+                break;
+
+            case 'T1050':
+                if ($testCount !== 1) {
+                    $reasons[] = 'Test count must be 1 for test code T1050.';
+                    break;
+                }
+
+                // Determines if the root ID exists on any given V4 order
+                $isRootExists = $this->orderRepository->checkRootIdExist($rootId);
+                if (! $isRootExists) {
+                    $reasons[] = 'Root ID does not exist for test code T1050.';
+                    break;
+                }
+
+                // Determines if an order exists in the V4 scope
+                if (Order::where('adid', $rootId)->exists()) {
+                    $rootOrder = $this->orderRepository->getOrderByAdid($rootId);
+                    $orderId = $rootOrder->order_id;
+                    $orderTestCode = $rootOrder->productDefinition->test_code ?? null;
+
+                    if ($orderTestCode !== 'PR1030') {
+                        $reasons[] = 'Root ID does not belong to a PR1030 profile order for test code T1050.';
+                    }
+
+                    $finalReportGenerated = $this->reportRepository->orderFinalReportIsGenerated($orderId);
+                    if (empty($finalReportGenerated)) {
+                        $reasons[] = 'Final report is not generated yet for the linked profile order.';
+                    }
+
+                    break; // early return so this doesn't run twice
+                }
+
+                // Determines if an order exists in the V2 scope
+                $rootOrder = app(V2OrderRepository::class)->get($rootId);
+                $orderTestCode = $rootOrder->getTestCode();
+
+                if ($orderTestCode !== 'PR1030') {
+                    $reasons[] = 'Root ID does not belong to a PR1030 profile order for test code T1050.';
+                }
+
+                $finalReportGenerated = app(OrderResultRepository::class)->get($rootOrder);
+
+                // Complicated conditional as $finalReportGenerated could be a collection, a model, or null
+                if (
+                    empty($finalReportGenerated) ||
+                    (is_object($finalReportGenerated) && method_exists($finalReportGenerated, 'isEmpty') && $finalReportGenerated->isEmpty())
+                ) {
+                    $reasons[] = 'Final report is not generated yet for the linked profile order.';
+                }
+
+                break;
+
+            case '14308':
+            case '14309':
+            case '14343':
+                if ($testCount !== 1) {
+                    $reasons[] = "Test count must be 1 for test code $testCode.";
+                }
+                break;
+        }
+
+        return $reasons;
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Jobs\BaseWorkflowJob;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+
+class PostOrderInductionJob extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    const NEW_ORDER_EVENT = "INB_ORD_PSTINDCT"; // @TODO, correct event, and is it necessary?
+
+    public function __construct(private $payload)
+    {
+        $this->payload = $payload;
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        var_dump("Job: PostOrderInductionJob");
+        $this->dispatchNextJob($this->payload);
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Http\Services\V4\ReportService;
+use App\Models\Master\SourceSystem;
+use App\Models\Order\Order;
+use App\QWorker\JobModel\ApiModel;
+use App\QWorker\JobModel\Mpc\MpcModel;
+use App\QWorker\JobModel\Order\OrderModel as QueueWorkerOrderModel;
+use App\QWorker\JobModel\Request\Request;
+use App\QWorker\Order\Order as QWorkerOrder;
+use App\Repositories\V4\Order\OrderConditionRepository;
+use App\Repositories\V4\Order\OrderRepository;
+use App\Repositories\V4\Order\ReportRepository;
+use Carbon\Carbon;
+use Exception;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Database\Eloquent\Casts\Json;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\DB;
+
+class ReportingToolJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected $orderId;
+
+    protected $sourceSystemId;
+
+    protected OrderRepository $orderRepository;
+
+    protected EventService $eventService;
+
+    protected ApiModel $apiModel;
+
+    protected OrderConditionRepository $conditionRepo;
+
+    protected QueueWorkerOrderModel $queueWorkerOrderModel;
+
+    protected ReportRepository $reportRepository;
+
+    protected QWorkerOrder $queueWorkerOrder;
+
+    protected Request $request;
+
+    protected $eventHistoryId = null;
+
+    protected OrderJobSpawnerV4 $orderJobSpawnerV4;
+
+    protected ReportService $reportService;
+
+    const EVENT_UDID = 'WIP_INB_TECH_WRK_U';
+
+    const TRANSFORM_TYPE = 'multiDocResultPdf';
+
+    const DEFAULT_EVENT_CONTEXT = 'OUTBOUND_DATA_TRANSFER';
+
+    const TRANSFORM_MIMETYPE = 'application/pdf';
+
+    const TRANSFORM_FORMAT = 'pdf';
+
+    const TRANSFORM_DIGEST_ALGO = 'sha256';
+
+    const INTERFACE_UDID = 'REPORTING_SERVICE';
+
+    const MONITORING_TEST_CODE = 'T1050';
+
+    const PROFILE_TEST_CODE = 'PR1030';
+
+    const BASELINE_TEST_CODE = 'T1040';
+
+    const PERSONALIZATION_TEST_CODE = 'T1030';
+
+    const ROOT_ID_PATH = 'UDFX10003';
+
+    const PROFILE_MRDC_XREF = 'MRDC10011';
+
+    const MONITORING_MRDC_XREF = 'MRDC10012';
+
+    const EDTA_TUBE_UDID = 'L';
+
+    const STRECK_TUBE_UDID = 'DN';
+
+    const TUMOR_TUBE_UDID = 'PB';
+
+    // Event types
+    const EVENT_RESULT_PARTIAL = 'OUT_ORD_RESPART';
+
+    const EVENT_RESULT_FINAL_STANDARD = 'OUT_ORD_RESFINS';
+
+    const EVENT_RESULT_ADDEND = 'OUT_ORD_RESADDE';
+
+    const EVENT_RESULT_AMENDED = 'OUT_ORD_RESAMME';
+
+    const EVENT_RESULT_AMENDED_ADDEND = 'OUT_ORD_RESAMAD';
+
+    // Result types
+    const RESULT_PRELIM = 'PRELIM';
+
+    const RESULT_FINAL = 'FINAL';
+
+    const RESULT_ADDEND = 'ADDEND';
+
+    const RESULT_AMEND = 'AMEND';
+
+    const RESULT_RECLASS = 'RECLASS';
+
+    const RESULT_DUPL = 'DUPL';
+
+    const RESULT_CORRECTED = 'CORRECTED';
+
+    const EDTA_BLOOD_COLLECTION_PATH = 'EDTABLOODCOLLECTIONDATE';
+
+    const TUMOR_BLOOD_COLLECTION_PATH = 'TUMORCOLLECTIONDDATE';
+
+    const BASELINE_BLOOD_COLLECTION_PATH = 'MRDBLOODCOLLECTIONDATE';
+
+    const MONITORING_BLOOD_COLLECTION_PATH = 'MRDBLOODCOLLECTIONDATE';
+
+    const EDTA_BLOOD_RECEIVED_PATH = 'BLOODRECEIVEDDATE';
+
+    const TUMOR_BLOOD_RECEIVED_PATH = 'TUMORRECEIVEDDATE';
+
+    const BASELINE_BLOOD_RECEIVED_PATH = 'MRDSTRECKTUBERECEIVEDDATE';
+
+    const MONITORING_BLOOD_RECEIVED_PATH = 'MRDSTRECKTUBERECEIVEDDATE';
+
+    const QDRS_INTERFACE_UDID = 'QDRS_IMAGE_REPOSITORY';
+
+    const QDRS_EVENT_UDID = 'OUT_REPORT_JSON';
+
+    /**
+     * Create a new job instance.
+     */
+    public function __construct($payload)
+    {
+        $this->orderRepository = app(OrderRepository::class);
+        $this->eventService = app(EventService::class);
+        $this->apiModel = app(ApiModel::class);
+        $this->queueWorkerOrderModel = app(queueWorkerOrderModel::class);
+        $this->reportRepository = app(ReportRepository::class);
+        $this->queueWorkerOrder = app(QWorkerOrder::class);
+        $this->orderJobSpawnerV4 = app(OrderJobSpawnerV4::class);
+        $this->reportService = app(ReportService::class);
+        $this->conditionRepo = app(OrderConditionRepository::class);
+        $this->payload = $payload;
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $payload = $this->payload;
+
+            $this->orderId = $payload['orderId'];
+
+            $orderDetails = $this->orderRepository->getOrder($this->orderId);
+
+            $this->sourceSystemId = $this->orderRepository->getOrderSourceSystemId($this->orderId);
+
+            $sourceSystem = SourceSystem::find($this->sourceSystemId);
+
+            $apiRequestId = $payload['apiRequestId'];
+
+            $this->generateAndSendReport(
+                $payload['orderedTest'],
+                $orderDetails,
+                $sourceSystem,
+                $this->sourceSystemId,
+                $apiRequestId,
+                $payload
+            );
+            DB::commit();
+        } catch (Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            // Use the CustomJobException
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    private function generateAndSendReport(string $test, Order $order, SourceSystem $sourceSystem, $sourceSystemId, int $apiRequestId, array $payload)
+    {
+        $testCode = $test;
+
+        $testPayload = $this->getTestPayload($this->orderId, $payload['orderedTest'], array_key_exists('reportStatus', $payload['data']) ? $payload['data']['reportStatus'] : null, $payload);
+
+        $eventUdid = Arr::get($testPayload, 'EventUdid');
+
+        /**
+         * This condition is here because after the FINAL T1040 our T1030 is CORRECTED.
+         * We're changing the orderedTest and the TestCode indexes to a T1040 because so that the PDF can generate
+         * the T1040. Note by this point the T1040 TCOMT has been sent by STARLIMS.
+         */
+        $changedBaselineToPersonalization = false;
+        $testPayload['OutboundHL7ReportStatus'] = $testPayload['OutboundHL7ReportStatus'] ?? null;
+        if ($testPayload['OutboundHL7ReportStatus'] === 'CORRECTED' && $payload['orderedTest'] === 'T1030') {
+            $payload['orderedTest'] = 'T1040';
+            $testPayload['TestCode'] = 'T1040';
+            $changedBaselineToPersonalization = true;
+        }
+
+        $payload['isCorrectedResult'] = false;
+        if ($payload['orderedTest'] === 'T1030' && $eventUdid === 'OUT_ORD_RESAMME') {
+            $payload['isCorrectedResult'] = true;
+            $payload['reportStatus'] = 'CORRECTED';
+        }
+
+        $orderHeaderPayload = $this->buildOrderPayload($order, $sourceSystemId);
+        $staticTextPayload = $this->buildStaticTextPayload();
+        $sampleDatePayload = $this->buildSampleDatePayload($this->orderId, $testPayload['TestCode']);
+        $mrdStreckBloodCollectionDate = Arr::get($sampleDatePayload, 'MRDCollectedDate', null);
+        $ntePayload = $this->buildNtePayload(
+            $order,
+            $testPayload['TestCode'],
+            $mrdStreckBloodCollectionDate,
+            array_key_exists('summaryOfReportChanges', $payload['data']) ? $payload['data']['summaryOfReportChanges'] : '',
+            $eventUdid
+        );
+        $reportPayload = array_merge(
+            $ntePayload,
+            $orderHeaderPayload,
+            $staticTextPayload,
+            $testPayload,
+            $sampleDatePayload
+        );
+
+        // Optional clean-up if needed
+        if (Arr::get($payload, 'reportAmendedWithTNPT')) {
+            $this->makeFieldsNullForReporting($reportPayload);
+        }
+
+        // Calling outbound API
+        $uri = $this->queueWorkerOrder->getInterfaceEndpoint(self::INTERFACE_UDID, self::EVENT_UDID);
+        $request = app(Request::class);
+
+        $authorization = $request->getServiceAuthorization(self::INTERFACE_UDID);
+        $currentIsoDateString = Carbon::now()->toISOString();
+        $signature = $this->make_signature($currentIsoDateString, $reportPayload);
+
+        $headers = [
+            $authorization['headerKey'].': '.$authorization['token'],
+            'Report-Timestamp: '.$currentIsoDateString,
+            'Report-Signature: '.$signature,
+        ];
+
+        $response = $request->callOutboundFileRequest(
+            $uri,
+            $headers,
+            $reportPayload,
+            $authorization['systemUserApiCredentialId'],
+            false,
+            false,
+            120
+        );
+
+        if ($response['responseStatusCode'] !== 200) {
+            throw new Exception('Error Sending Request To Reporting service');
+        }
+        $encodedPDF = $response['response'];
+        $jobId = (int) $this->job->getLogId();
+
+        // Store event
+        $event = $this->eventService->storeOrderEvent(
+            $order,
+            $eventUdid,
+            $sourceSystem->udid,
+            $apiRequestId,
+            $jobId,
+            $response['apiRequestId'],
+            $payload['orderedTest']
+        );
+
+        $this->eventHistoryId = $event->order_event_id;
+
+        /**
+         * On the comment above in line 251 we changed the orderedTest to T1040 because the PDF needs to be generated
+         * So we're changing it back to the T1030 because that's what the original test was so it should be recorded as such
+         */
+        if ($changedBaselineToPersonalization) {
+            $payload['orderedTest'] = 'T1030';
+        }
+        // Save result report
+        $meta = [
+            'resultTransformType' => self::TRANSFORM_TYPE,
+            'valueMimetype' => self::TRANSFORM_MIMETYPE,
+            'format' => self::TRANSFORM_FORMAT,
+            'digestAlgo' => self::TRANSFORM_DIGEST_ALGO,
+        ];
+
+        $data = [
+            'test_code' => $payload['orderedTest'],
+            'report_status_udid' => $testPayload['OutboundHL7ReportStatus'],
+            'order_event_id' => $this->eventHistoryId,
+            'reported_on' => now(),
+            'sourceSystemId' => $sourceSystemId,
+            'meta' => $meta,
+        ];
+
+        $orderReport = $this->reportService->createOrderReport($order, $data);
+        $detaildata = [
+            'value' => $encodedPDF,
+            'source_system_id' => $sourceSystemId,
+
+        ];
+        $this->reportService->createOrderDetailReport($orderReport, $detaildata);
+
+        $this->sendReportPayloadToQdrs($reportPayload, $orderReport->report_id, $order, $sourceSystem->udid);
+
+        $this->orderJobSpawnerV4->spawn(get_class($this), [
+            'orderId' => $this->payload['orderId'],
+            'data' => [
+                'orderId' => $this->payload['orderId'],
+                'test_code' => $payload['orderedTest'],
+                'report_id' => $orderReport->report_id,
+                'apiRequestId' => $payload['data']['apiRequestId'],
+                'jobChainOriginSourceSystemId' => $sourceSystemId,
+                'sourceSystemUdid' => $sourceSystem->udid,
+                'eventUdid' => 'WIP_INTCHKP_RESTRDF',
+                'rptStatusUdid' => $testPayload['OutboundHL7ReportStatus'],
+                'reportedOn' => Carbon::now()->format('Y-m-d H:i:s'),
+                'orderedTest' => $testCode,
+                'originalTest' => $payload['originalTest'] ?? null,
+                'isCorrectedResult' => $payload['isCorrectedResult'],
+                'reportAmendedWithTNPT' => false,
+                'eventHistoryId' => $this->eventHistoryId,
+                'summaryOfReportChanges' => $payload['data']['summaryOfReportChanges'] ?? null,
+                'reportAmendedWithTNPT' => Arr::get($this->payload, 'reportAmendedWithTNPT', false),
+            ],
+        ]);
+    }
+
+    private function buildNtePayload(
+        Order $order,
+        string $testCode,
+        ?string $mrdStreckBloodCollectionDate = null,
+        ?string $summaryOfReportChanges = null,
+        ?string $eventUdid = null
+    ): array {
+        $rootOrder = $this->orderRepository->getOrderByAdid($order->root_id);
+
+        $nteValueMappings = ($testCode == self::MONITORING_TEST_CODE) ? array_merge($this->getMonitoringMappings(), $this->getProfileMappings($eventUdid)) : $this->getProfileMappings($eventUdid);
+
+        $payload = $this->getMappingValues($order, $rootOrder, $nteValueMappings);
+
+        // we are not getting ReportDate from StarLims in the mpdd
+        $payload['ReportDate'] = Carbon::now('US/Central')->format('Y-m-d');
+        if ($summaryOfReportChanges) {
+            switch ($testCode) {
+                case self::PERSONALIZATION_TEST_CODE:
+                    $payload['PartialReportAmendedComment'] = $summaryOfReportChanges;
+                    break;
+                case self::BASELINE_TEST_CODE:
+                    $payload['FinalReportAmendedComment'] = $summaryOfReportChanges;
+                    break;
+                case self::MONITORING_TEST_CODE:
+                    $payload['ReportAmendedComment'] = $summaryOfReportChanges;
+                    break;
+            }
+        }
+
+        $testHistory = [];
+        if (isset($this->payload['testCode'])) {
+            $testCode = $this->payload['testCode'];
+        }
+        switch ($testCode) {
+            case self::BASELINE_TEST_CODE:
+                $collectionDate = Carbon::parse($mrdStreckBloodCollectionDate);
+                $testHistoryTemp = [];
+                $testHistoryTemp['CollectionDate'] = $collectionDate->format('m/d/y');
+                $testHistoryTemp['MRDResult'] = $payload['MRDResult'];
+                $testHistoryTemp['MMMPerMLPlasma'] = floatval($payload['MMMPerMLPlasma']);
+                $testHistoryTemp['MMMDeviationLower'] = floatval($payload['MMMDeviationLower']);
+                $testHistoryTemp['MMMDeviationUpper'] = floatval($payload['MMMDeviationUpper']);
+                $testHistoryTemp['MutationsDetected'] = floatval($payload['MutationsDetected']);
+                $testHistoryTemp['EvaluableMutations'] = floatval($payload['EvaluableMutations']);
+                $testHistory[] = $testHistoryTemp;
+                break;
+            case self::MONITORING_TEST_CODE:
+                $testHistory = self::buildMonitoringTestHistory($order, $rootOrder);
+                break;
+        }
+        $payload['TestHistory'] = $testHistory;
+
+        return $payload;
+    }
+
+    private function getMappingValues(Order $order, Order $rootOrder, array $nteValueMappings): array
+    {
+        $payload = [];
+        foreach ($nteValueMappings as $key => $row) {
+
+            $expendKey = explode('.', $key);
+            $OrderTestcode = $expendKey[0];
+            $identity = $expendKey[1];
+            if (count($expendKey) == 4) {
+                $upperIdentityKey = $expendKey[2];
+                $identityKey = $expendKey[3];
+            } else {
+                $identityKey = $expendKey[2];
+            }
+
+            if ($OrderTestcode == 'T1040' || $OrderTestcode == 'T1030') {
+                $CurrentOrder = $rootOrder;
+            } else {
+                $CurrentOrder = $order;
+            }
+
+            $orderTestDtails = $CurrentOrder->tests()->where('test_code', $OrderTestcode)->first();
+            if ($identity == 'NTE' && ! empty($orderTestDtails->nte_details) && array_key_exists($identityKey, $orderTestDtails->nte_details)) {
+                $payload[$row] = $orderTestDtails->nte_details[$identityKey]['value'];
+            } elseif ($identity == 'OBX' && ! empty($orderTestDtails->detail[0]) && array_key_exists($identityKey, $orderTestDtails->detail[0])) {
+                $payload[$row] = $orderTestDtails->detail[0][$identityKey]['resultValue'];
+            } elseif ($identity == 'Order' && ! empty($CurrentOrder->detail[$upperIdentityKey]) && array_key_exists($identityKey, $CurrentOrder->detail[$upperIdentityKey])) {
+
+                $identityKeyExpend = explode('-', $identityKey);
+                if (count($identityKeyExpend) > 1) {
+                    $payload[$row] = $CurrentOrder->detail[$upperIdentityKey][$identityKeyExpend[0]].' '.$CurrentOrder->detail[$upperIdentityKey][$identityKeyExpend[1]];
+                } else {
+                    $payload[$row] = $CurrentOrder->detail[$upperIdentityKey][$identityKeyExpend[0]];
+                }
+            } else {
+                $payload[$row] = null;
+            }
+        }
+
+        return $payload;
+    }
+
+    private function buildMonitoringTestHistory(Order $order, Order $rootOrder): array
+    {
+
+        $profilenteValueMappings = $this->getProfileMappings('');
+
+        $payload = $this->getMappingValues($order, $rootOrder, $profilenteValueMappings);
+
+        $testHistoryTemp = [];
+        $testHistoryTemp['MRDResult'] = $payload['MRDResult'];
+        $testHistoryTemp['MMMPerMLPlasma'] = floatval($payload['MMMPerMLPlasma']);
+        $testHistoryTemp['MMMDeviationLower'] = floatval($payload['MMMDeviationLower']);
+        $testHistoryTemp['MMMDeviationUpper'] = floatval($payload['MMMDeviationUpper']);
+        $testHistoryTemp['MutationsDetected'] = floatval($payload['MutationsDetected']);
+        $testHistoryTemp['EvaluableMutations'] = floatval($payload['EvaluableMutations']);
+        $sampleDatePayload = $this->buildSampleDatePayload($rootOrder->order_id, 'T1040');
+        $collectionDate = ! empty($sampleDatePayload['EdtaCollectedDate']) ? Carbon::parse($sampleDatePayload['EdtaCollectedDate'])->format('m/d/y') : Carbon::parse($sampleDatePayload['MRDCollectedDate'])->format('m/d/y');
+
+        if ($this->conditionRepo->hasCondition($rootOrder->order_id, 'TNPW')) {
+            $MRDResult = 'NO RESULT';
+
+            if (! $collectionDate) {
+                $date = explode('.', $rootOrder->adid)[1];
+                $collectionDate = Carbon::parse($date)->format('m/d/Y');
+            }
+            $testHistoryTemp['MRDResult'] = $MRDResult;
+            $testHistoryTemp['CollectionDate'] = $collectionDate;
+        }
+        $testHistory[] = $testHistoryTemp;
+
+        $monitoringnteValueMappings = $this->getMonitoringMappings();
+        $payload = $this->getMappingValues($order, $rootOrder, $monitoringnteValueMappings);
+
+        $testHistoryTemp = [];
+        $testHistoryTemp['MRDResult'] = $payload['MRDResult'];
+        $testHistoryTemp['MMMPerMLPlasma'] = floatval($payload['MMMPerMLPlasma']);
+        $testHistoryTemp['MMMDeviationLower'] = floatval($payload['MMMDeviationLower']);
+        $testHistoryTemp['MMMDeviationUpper'] = floatval($payload['MMMDeviationUpper']);
+        $testHistoryTemp['MutationsDetected'] = floatval($payload['MutationsDetected']);
+        $testHistoryTemp['EvaluableMutations'] = floatval($payload['EvaluableMutations']);
+        $sampleDatePayload = $this->buildSampleDatePayload($order->order_id, 'T1050');
+        $collectionDate = Carbon::parse($sampleDatePayload['MRDCollectedDate'])->format('m/d/y');
+
+        if ($this->conditionRepo->hasCondition($order->order_id, 'TNPW')) {
+            $MRDResult = 'NO RESULT';
+
+            if (! $collectionDate) {
+                $date = explode('.', $order->adid)[1];
+                $collectionDate = Carbon::parse($date)->format('m/d/Y');
+            }
+            $testHistoryTemp['MRDResult'] = $MRDResult;
+            $testHistoryTemp['CollectionDate'] = $collectionDate;
+        }
+        $testHistory[] = $testHistoryTemp;
+
+        return $testHistory;
+    }
+
+    private function make_signature($currentTimestamp, $payload)
+    {
+        $serviceKey = getenv('REPORTING_SERVICE_KEY') ?: '';
+
+        // these str_replaces are needed to match the json format in the python script in reporting service
+        $jsonPayload = json_encode($payload);
+
+        $payloadStamp = $currentTimestamp.PHP_EOL.$jsonPayload;
+
+        // Convert the service key to UTF-8
+        $key = mb_convert_encoding($serviceKey, 'UTF-8', mb_internal_encoding());
+
+        return strtoupper(hash_hmac('sha256', $payloadStamp, $key));
+    }
+
+    /**
+     * Get the test code of the ordered test
+     *
+     * @param  int  $apiRequestId  api request id
+     * @param  string  $orderedTest  ordered test
+     * @param  string|null  $reportStatus  report status
+     * @return array ordered test data to be passed to reporting service
+     */
+    protected function getTestPayload(int $orderId, string $orderedTest, ?string $reportStatus, array $payload): array
+    {
+
+        $conditionCode = $payload['conditionCode'] ?? null;
+        $testPayload = [];
+        if ($reportStatus) {
+            $testPayload['OutboundHL7ReportStatus'] = $reportStatus;
+
+            if ($reportStatus === 'CORRECTED') {
+                $testPayload['ReportStatus'] = $this->reportRepository->checkReportStatus($orderId, 'FINAL') ? 'FINAL' : 'PRELIM';
+            }
+
+            $testPayload['TestCode'] = $orderedTest;  // T1030/T1040/T1050
+            $testPayload['EventUdid'] = $this->resultTypeToEventUdid($testPayload['ReportStatus']);
+
+            return $testPayload;
+        }
+
+        $condition = $payload['conditionCode'] ?? null;
+        if ($condition) {
+            $testUdid = $orderedTest ?? null;
+            $testPayload['OutboundHL7ReportStatus'] = $conditionCode == 'REPORTAMENDED' ? 'CORRECTED' : 'FINAL';
+            $testPayload['ReportStatus'] = 'FINAL';
+            if ($testUdid === 'T1030') {
+                $testPayload['ReportStatus'] = 'PRELIM';
+                $testPayload['OutboundHL7ReportStatus'] = 'PRELIM';
+                if ($conditionCode == 'REPORTAMENDED') {
+                    $testPayload['ReportStatus'] = $this->reportRepository->checkReportStatus($orderId, 'FINAL') ? 'FINAL' : 'PRELIM';
+                    $testPayload['OutboundHL7ReportStatus'] = $this->reportRepository->checkReportStatus($orderId, 'FINAL') ? 'FINAL' : 'PRELIM';
+                }
+            }
+            $testPayload['TestCode'] = $testUdid;
+            $eventUdid = $this->resultTypeToEventUdid(isset($this->payload['resultType']) ? $this->payload['resultType'] : $testPayload['OutboundHL7ReportStatus']);
+            if ($testUdid === 'T1030' && $conditionCode == 'REPORTAMENDED') {
+                $eventUdid = $this->resultTypeToEventUdid('CORRECTED');
+            }
+            $testPayload['EventUdid'] = $eventUdid;
+        }
+        $tnpCases = ($conditionCode == 'TNPT' || $conditionCode == 'TNPW') ? $conditionCode : null;
+        if ($tnpCases) {
+            $tnpCode = $payload['tnp']['code'];
+            $tnpMessage = $payload['tnp']['message'];
+            $testPayload['TNPCode'] = $tnpCode;
+            $testPayload['TNPMessage'] = $tnpMessage;
+        }
+
+        return $testPayload;
+    }
+
+    protected function resultTypeToEventUdid(string $resultType): string
+    {
+        switch ($resultType) {
+            case self::RESULT_PRELIM:
+                return self::EVENT_RESULT_PARTIAL;
+            case self::RESULT_FINAL:
+                return self::EVENT_RESULT_FINAL_STANDARD;
+            case self::RESULT_ADDEND:
+                return self::EVENT_RESULT_ADDEND;
+            case self::RESULT_AMEND:
+            case self::RESULT_CORRECTED:
+                return self::EVENT_RESULT_AMENDED;
+            case self::RESULT_RECLASS:
+            case self::RESULT_DUPL:
+                throw new Exception("No corresponding event exists for ResultType: $resultType");
+            default:
+                throw new Exception("Invalid ResultType: $resultType");
+        }
+    }
+
+    private function buildSampleDatePayload(int $orderId, string $testCode): array
+    {
+        $sampleDatePayload = [];
+
+        [$edtaCollectedDate, $edtaReceivedDate] = $this->orderRepository->getCorrectedBloodDatesByOrderIdAndObxKey($orderId, [self::EDTA_BLOOD_COLLECTION_PATH, self::EDTA_BLOOD_RECEIVED_PATH], self::EDTA_TUBE_UDID, 'T1030');
+        [$tumorCollectedDate, $tumorReceivedDate] = $this->orderRepository->getCorrectedBloodDatesByOrderIdAndObxKey($orderId, [self::TUMOR_BLOOD_COLLECTION_PATH, self::TUMOR_BLOOD_RECEIVED_PATH], self::TUMOR_TUBE_UDID, 'T1030');
+        [$streckCollectedDate, $streckReceivedDate] = $this->orderRepository->getCorrectedBloodDatesByOrderIdAndObxKey($orderId, $testCode === self::BASELINE_TEST_CODE ? [self::BASELINE_BLOOD_COLLECTION_PATH, self::BASELINE_BLOOD_RECEIVED_PATH] : [self::MONITORING_BLOOD_COLLECTION_PATH, self::MONITORING_BLOOD_RECEIVED_PATH], self::STRECK_TUBE_UDID, $testCode);
+
+        if ($testCode == self::PERSONALIZATION_TEST_CODE) {
+            $sampleDatePayload['SpecimenInformationReceivedDate'] = $tumorReceivedDate;
+            $sampleDatePayload['SpecimenInformationCollectedDate'] = $tumorCollectedDate;
+            $sampleDatePayload['EdtaCollectedDate'] = $edtaCollectedDate;
+            $sampleDatePayload['EdtaReceivedDate'] = $edtaReceivedDate;
+            $sampleDatePayload['MRDCollectedDate'] = $streckCollectedDate;
+            $sampleDatePayload['MRDReceivedDate'] = $streckReceivedDate;
+        } elseif ($testCode == self::BASELINE_TEST_CODE) {
+            $sampleDatePayload['SpecimenInformationCollectedDate'] = $tumorCollectedDate;
+            $sampleDatePayload['SpecimenInformationReceivedDate'] = $tumorReceivedDate;
+            $sampleDatePayload['EdtaCollectedDate'] = $edtaCollectedDate;
+            $sampleDatePayload['EdtaReceivedDate'] = $edtaReceivedDate;
+            $sampleDatePayload['MRDCollectedDate'] = $streckCollectedDate;
+            $sampleDatePayload['MRDReceivedDate'] = $streckReceivedDate;
+            $sampleDatePayload['DatePlasmaCollected'] = $streckCollectedDate;
+            $sampleDatePayload['DatePlasmaReceived'] = $streckReceivedDate;
+        } elseif ($testCode == self::MONITORING_TEST_CODE) {
+            $sampleDatePayload['SpecimenInformationCollectedDate'] = $streckCollectedDate;
+            $sampleDatePayload['SpecimenInformationReceivedDate'] = $streckReceivedDate;
+            $sampleDatePayload['MRDCollectedDate'] = $streckCollectedDate;
+            $sampleDatePayload['MRDReceivedDate'] = $streckReceivedDate;
+            $sampleDatePayload['DatePlasmaCollected'] = $streckCollectedDate;
+            $sampleDatePayload['DatePlasmaReceived'] = $streckReceivedDate;
+        }
+
+        return $sampleDatePayload;
+    }
+
+    /**
+     * Create an order result report payload entry.
+     *
+     * @return int report payload id
+     */
+    private function createResultReportPayload(int $orderId, int $sourceSystemId, string $reportStatus, string $orderedTest): int
+    {
+        $mpcModel = app(MpcModel::class);
+
+        $snapshot = $mpcModel->getMpcSnapshotForResultPayload($orderId);
+
+        return $this->queueWorkerOrder->createResultReportPayload([
+            'gidId' => $orderId,
+            'systemEventHistoryId' => $this->eventHistoryId,
+            'reportingSourceSystemId' => 0,
+            'reportStatus' => $reportStatus == 'Partial' ? 'PRELIM' : $reportStatus,
+            'digest' => $snapshot['resultReportPayloadDigestHex'],
+            'trunc_digest' => $snapshot['resultReportPayloadDigestHex'],
+            'mpcSnapshot' => $snapshot['mpcSnapshot'],
+            'sourceSystemId' => $sourceSystemId,
+            'reportedOn' => date('Y-m-d H:i:s'),
+            'orderedTest' => $orderedTest,
+        ]);
+    }
+
+    private function buildOrderPayload(Order $order, int $sourceSystemId): array
+    {
+        $orderPayload = [];
+
+        $details = $order->detail;
+
+        // Patient Details
+        $patient = $details['patient'] ?? [];
+        $suffix = isset($patient['patientInitials']) ? ' '.strtoupper($patient['patientInitials']) : '';
+        $orderPayload['PatientName'] = strtoupper($patient['patientSurname'] ?? '').', '.strtoupper($patient['patientGivenName'] ?? '').$suffix;
+        $orderPayload['patientGivenName'] = $patient['patientGivenName'] ?? null;
+        $orderPayload['patientSurname'] = $patient['patientSurname'] ?? null;
+        $orderPayload['BiologicalSex'] = $patient['patientSex'] ?? null;
+        $orderPayload['DateOfBirth'] = $patient['patientDOB'] ?? null;
+
+        // Client Details
+        $client = $details['client'] ?? [];
+        $orderPayload['ClientID'] = $client['clientId'] ?? null;
+        $orderPayload['ClientName'] = $client['clientName'] ?? null;
+        $orderPayload['labReferenceId'] = $client['clientLabRefId'] ?? null;
+
+        // Order Fields
+        $fields = $details['fields'] ?? [];
+        $orderPayload['patientSsidEpid'] = $fields['EPID'] ?? null;
+        $firstSample = $order->tests->first()->samples->first() ?? null;
+        $orderPayload['collectionDatetime'] = $firstSample->collectionDatetime ?? null;
+        $orderPayload['collectionDatetimeTz'] = $firstSample->collectionDatetimeTz ?? null;
+
+        $adidParts = explode('.', $order->adid);
+        $orderPayload['QLSAccessionNumber'] = end($adidParts);
+        $orderPayload['DateOfService'] = date('Y-m-d', strtotime($order->created)) ?? null;
+
+        // Aliases and Test Info from 'items'
+        $orderPayload['aliases'] = $this->getAliases($order->productDefinition->test_code);
+
+        return $orderPayload;
+    }
+
+    private function getAliases(string $testCode): array
+    {
+        $aliases = [
+            'PR1030' => [
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC1',
+                    'aliasValue' => '13128Z3E=',
+                    'nomenclature' => 'Mnemonic, first internal for Haystack Personalization',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1030',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC2',
+                    'aliasValue' => '13128Z3E',
+                    'nomenclature' => 'Mnemonic, second internal for Haystack Personalization',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1030',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC3',
+                    'aliasValue' => 'Z1113128',
+                    'nomenclature' => 'Mnemonic, third internal for Haystack Personalization',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1030',
+                ],
+                [
+                    'typeUdid' => '99QDI',
+                    'aliasValue' => '13128',
+                    'nomenclature' => 'HAYSTACK MRD(TM) PERSONALIZATION',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1030',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC1',
+                    'aliasValue' => '13144Z3E=',
+                    'nomenclature' => 'Mnemonic, first internal for Haystack Baseline',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1040',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC2',
+                    'aliasValue' => '13144Z3E',
+                    'nomenclature' => 'Mnemonic, second internal for Haystack Baseline',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1040',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC3',
+                    'aliasValue' => 'Z1113144',
+                    'nomenclature' => 'Mnemonic, third internal for Haystack Baseline',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1040',
+                ],
+                [
+                    'typeUdid' => '99QDI',
+                    'aliasValue' => '13144',
+                    'nomenclature' => 'HAYSTACK MRD(TM) BASELINE',
+                    'aliasRelatedType' => 'ANCHOR',
+                    'aliasRelatedUdid' => 'T1040',
+                ],
+            ],
+            'T1050' => [
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC1',
+                    'aliasValue' => '13151Z3E=',
+                    'nomenclature' => 'Mnemonic, first internal for Haystack Monitoring',
+                    'aliasRelatedType' => 'RELEASE',
+                    'aliasRelatedUdid' => '8700013151',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC2',
+                    'aliasValue' => '13151Z3E',
+                    'nomenclature' => 'Mnemonic, second internal for Haystack Monitoring',
+                    'aliasRelatedType' => 'RELEASE',
+                    'aliasRelatedUdid' => '8700013151',
+                ],
+                [
+                    'typeUdid' => 'MNEMONIC_AIOC3',
+                    'aliasValue' => 'Z1113151',
+                    'nomenclature' => 'Mnemonic, third internal for Haystack Monitoring',
+                    'aliasRelatedType' => 'RELEASE',
+                    'aliasRelatedUdid' => '8700013151',
+                ],
+                [
+                    'typeUdid' => '99QDI',
+                    'aliasValue' => '13151',
+                    'nomenclature' => 'HAYSTACK MRD(TM) MONITORING',
+                    'aliasRelatedType' => 'RELEASE',
+                    'aliasRelatedUdid' => '8700013151',
+                ],
+            ],
+        ];
+
+        return $aliases[$testCode] ?? [];
+    }
+
+    private function buildStaticTextPayload(): array
+    {
+        $performingSite['LaboratoryName'] = 'LEW';
+        $performingSite['Address'] = 'Med fusion, 2501 South State Highway 121, Suite 1100 Lewisville, TX 75067-8188,';
+        $performingSite['LaboratoryDirector'] = 'Ithiel James L. Frame';
+        $performingSite['LaboratoryDirectorTitle'] = 'MD, PhD';
+        $performingSite['CLIA'] = '45D2004217';
+
+        $staticText['LimitationsAndDisclaimersStaticText'] = 'Haystack MRD&trade; was designed and analytically validated for the detection of ctDNA in patients with a previous or current diagnosis of a solid tumor cancer, regardless of cancer type or subtype. Certain cancer types may have limited shedding of ctDNA into the bloodstream such as primary brain, thyroid, and renal cancers, which may result in reduced ctDNA detection. Clinically, this test may be useful for the detection of ctDNA to indicate the presence of MRD after curative-intent treatment, to monitor response to treatment, and to provide early signs of cancer recurrence; however, results should be interpreted by the clinician for individual patients in the context of clinicopathologic information. New primary tumors are unlikely to be detected due to limited overlap of somatic mutations between the tumor that is sequenced for MRD monitoring and a new tumor that arises independently. Test sensitivity may be reduced when fewer than 50 tumor-specific mutations are tracked. This test is not designed to detect or report germline variants, nor infer hereditary cancer risk for the patient. Test performance has not been established and may be minimally impacted for patients who have concurrent malignancies, hematologic malignancies, are pregnant, have received a recent blood transfusion, or have a history of bone marrow/stem cell transplantation within the last three months.';
+        $staticText['MethodologyStaticText'] = "Tumor DNA is extracted from a formalin-fixed paraffin embedded (FFPE) tumor specimen. Genomic DNA is extracted from whole blood collected in an EDTA tube. Cell-free DNA (cfDNA) is extracted from plasma derived from blood collected in Streck cell-free DNA blood collection tubes. Tumor and matched normal DNA samples undergo whole-exome sequencing to identify tumor-specific somatic mutations. Mutations associated with clonal hematopoiesis of indeterminate potential (CHIP) and germline-derived variants are excluded. A personalized target enrichment panel is designed with Haystack MRD's personalized test configuration algorithm from the patient-specific set of somatic mutations. The resulting patient-specific panel is used for cfDNA analysis at each time point tested to detect the presence or absence of circulating tumor DNA (ctDNA). Haystack MRD&trade; is a semi-quantitative test that reports in units of mean ctDNA molecules per mL of plasma. It is currently unknown if a single time point value has a clinical significance, and should not be interpreted outside of the context of an individual patient.<br /><br />The minimum and maximum inputs of cfDNA into this assay are 3,636 and 50,000 Genomic Equivalents (GE). The limit of detection (LoD95) is defined as the concentration of ctDNA at which a positive sample will be detected 95% of the time. The LoD95 for Haystack MRD&trade; around the maximum cfDNA input is 0.006% Tumor Fraction (TF), which represents the average mutation allele frequency (MAF) of all interrogated targets.";
+        $staticText['ReportInterpretationStaticText'] = 'Haystack MRD&trade; is a tumor-informed minimal residual disease (MRD) test that reports the presence or absence of circulating tumor DNA (ctDNA) in the blood of patients with a previous or current diagnosis of a solid tumor cancer. Several studies have demonstrated that the detection of ctDNA after curative intent treatment may be linked to an increased risk of disease recurrence and, conversely, when ctDNA is not detected the risk of recurrence may be lower (PMID: 27384348, 28445469, 31070691, 31621801, 31070668, 33232761). The longitudinal monitoring of ctDNA has been demonstrated to identify cancer progression, recurrence, or relapse before there is clinical or radiographical evidence of progression, recurrence, or relapse (PMID: 28445469, 30992300, 34505064, 31070691, 34625408 ). Serial monitoring of ctDNA dynamics has also been shown to be a predictor of therapy response (PMID: 25851626, 29721388, 29330207, 29423503, 31439586,  32914028, 35121950 ). A Haystack MRD&trade; "MRD Detected" result indicates the presence of residual cancer in the body. A Haystack MRD "MRD Not Detected" result reflects lack of ctDNA detection at the time of blood draw, which may indicate the absence of residual cancer but does not definitively exclude the possibility of residual disease in the patient.<br /><br />The level of detectable ctDNA can vary due to biological factors that are unrelated to tumor status. The results of this test should be interpreted in the context of tumor pathology, patient characteristics, standard risk features, radiography, and other laboratory data.';
+        $staticText['ReportVersionStaticText'] = 'HO CR-001-01';
+        $staticText['TestOverviewStaticText'] = 'Haystack MRD is a personalized next-generation sequencing-based test used to detect and quantify circulating tumor DNA (ctDNA) in the bloodstream of patients who have been previously diagnosed with a solid tumor. The personalized test tracks up to 50 somatic mutations which are informed by tumor and matched normal sequencing.';
+        $staticText['PerformingSite'] = $performingSite;
+
+        $staticTextArr['StaticText'] = $staticText;
+
+        return $staticTextArr;
+    }
+
+    private function getProfileMappings(string $eventUdid): array
+    {
+        $mappings = [
+            'T1040.NTE.lisReceivedSpecimenId' => 'SampleID',
+            'T1040.NTE.' => 'ReportDate',
+            'T1040.NTE.finalReportedOnDateAndTime' => 'FinalReportStatus',
+            'T1040.NTE.evaluableMutations' => 'EvaluableMutations',
+            'T1040.NTE.mutationsDetected' => 'MutationsDetected',
+            'T1040.NTE.meanMutantMolecules' => 'MeanMutantMolecules',
+            'T1040.NTE.mmmDeviationLower' => 'MMMDeviationLower',
+            'T1040.NTE.mmmDeviationUpper' => 'MMMDeviationUpper',
+            'T1040.NTE.mmmPerMlPlasma' => 'MMMPerMLPlasma',
+            'T1040.NTE.mrdResult' => 'MRDResult',
+            'T1040.NTE.reportableComments' => 'ReportComments',
+            'T1040.NTE.sumTmmPerMlPlasmaBelowVariantCutoff' => 'SumTMMPerMLPlasmaBelowVariantCutoff',
+            'T1040.Order.provider.physicianSurname-physicianGivenName' => 'PhysicianName',
+            'T1040.Order.fields.placerOrderXrefNumber' => 'AccessionNumber',
+            'T1040.NTE.displayAccessionNumber' => 'DisplayAccessionNumber',
+            'T1040.NTE.amendedReport' => 'AmendedReport',
+            'T1030.NTE.datePlasmaCollected' => 'DatePlasmaCollected',
+            'T1030.NTE.datePlasmaReceived' => 'DatePlasmaReceived',
+            'T1030.NTE.dateTissueCollected' => 'DateTissueCollected',
+            'T1030.NTE.dateTissueReceived' => 'DateTissueReceived',
+            'T1030.OBX.TUMORRECEIVEDDATE' => 'TumorReceivedDate',
+            'T1030.OBX.TUMORCOLLECTIONDATE' => 'TumorCollectionDate',
+            'T1050.NTE.mrn' => 'MRN',
+            'T1030.OBX.RECORDEDDIAGNOSIS' => 'RecordedDiagnosis',
+            'T1030.OBX.DATEOFDIAGNOSIS' => 'DateOfDiagnosis',
+            'T1030.OBX.TUMORSPECIMENID' => 'TumorSpecimenId',
+            'T1030.OBX.TUMORSOURCE' => 'TumorSource',
+            'T1030.OBX.EDTABLOODCOLLECTIONDATE' => 'BloodCollectionDate',
+            'T1030.OBX.BLOODRECEIVEDDATE' => 'BloodReceivedDate',
+            'T1030.OBX.SURGERYDATE' => 'SurgeryDate',
+            'T1040.NTE.reportAmendedComment' => 'ReportAmendedComment',
+        ];
+
+        return $eventUdid === 'OUT_ORD_RESAMME' ? array_merge($mappings, ['T1030.NTE.PartialReportAmendedComment' => 'PartialReportAmendedComment']) : $mappings;
+    }
+
+    private function getMonitoringMappings(): array
+    {
+        return [
+            'T1050.NTE.lisReceivedSpecimenId' => 'SampleID',
+            'T1050.NTE.finalReportedOnDateAndTime' => 'ReportDate',
+            'T1050.NTE.finalReportStatus' => 'FinalReportStatus',
+            'T1050.NTE.mutationsDetected' => 'MutationsDetected',
+            'T1050.NTE.meanMutantMolecules' => 'MeanMutantMolecules',
+            'T1050.NTE.mmmDeviationLower' => 'MMMDeviationLower',
+            'T1050.NTE.mmmDeviationUpper' => 'MMMDeviationUpper',
+            'T1050.NTE.mmmPerMlPlasma' => 'MMMPerMLPlasma',
+            'T1050.NTE.mrdResult' => 'MRDResult',
+            'T1050.NTE.reportableComments' => 'ReportComments',
+            'T1050.NTE.sumTmmPerMlPlasmaBelowVariantCutoff' => 'SumTMMPerMLPlasmaBelowVariantCutoff',
+            'T1050.Order.provider.physicianSurname-physicianGivenName' => 'PhysicianName',
+            'T1050.Order.fields.placerOrderXrefNumber' => 'AccessionNumber',
+            'T1050.NTE.displayAccessionNumber' => 'DisplayAccessionNumber',
+            'T1050.NTE.amendedReport' => 'AmendedReport',
+            'T1050.NTE.datePlasmaCollected' => 'DatePlasmaCollected',
+            'T1050.NTE.datePlasmaReceived' => 'DatePlasmaReceived',
+            'T1050.NTE.dateTissueCollected' => 'DateTissueCollected',
+            'T1050.NTE.dateTissueReceived' => 'DateTissueReceived',
+            'T1050.NTE.mrn' => 'MRN',
+            'T1050.OBX.MRDBLOODCOLLECTIONDATE' => 'StreckBloodCollectionDate',
+            'T1050.NTE.evaluableMutations' => 'EvaluableMutations',
+            'T1050.NTE.reportAmendedComment' => 'ReportAmendedComment',
+        ];
+    }
+
+    private function makeFieldsNullForReporting(array &$reportPayload): void
+    {
+        $reportPayload['MRDResult'] = null;
+        $reportPayload['MMMDeviationUpper'] = null;
+        $reportPayload['MMMDeviationLower'] = null;
+        $reportPayload['MutationsDetected'] = null;
+        $reportPayload['MMMPerMLPlasma'] = null;
+        $reportPayload['EvaluableMutations'] = null;
+        $reportPayload['SumTMMPerMLPlasmaBelowVariantCutoff'] = null;
+        $reportPayload['TestHistory'][count($reportPayload['TestHistory']) - 1]['MRDResult'] = null;
+        $reportPayload['TestHistory'][count($reportPayload['TestHistory']) - 1]['MMMPerMLPlasma'] = 0;
+        $reportPayload['TestHistory'][count($reportPayload['TestHistory']) - 1]['MMMDeviationLower'] = 0;
+        $reportPayload['TestHistory'][count($reportPayload['TestHistory']) - 1]['MMMDeviationUpper'] = 0;
+        $reportPayload['TestHistory'][count($reportPayload['TestHistory']) - 1]['MutationsDetected'] = 0;
+        $reportPayload['TestHistory'][count($reportPayload['TestHistory']) - 1]['EvaluableMutations'] = 0;
+    }
+
+    private function sendReportPayloadToQdrs(array $reportPayload, string $report_id, Order $order, string $sourceSystemUdid): void
+    {
+        $currentTimestamp = Carbon::now()->format('Y-m-d\TH:i:s.u\Z');
+        $request = app(Request::class);
+
+        // don't want to include DateOfService in contentData array below
+        $dateOfService = $reportPayload['DateOfService'];
+        unset($reportPayload['DateOfService']);
+        
+        $prismOrderAdId = ['PrismOrderAdId' => $order->adid];
+
+        // QDRS Mandated (Sample Collection Date).
+        $dateCollected = $reportPayload['DatePlasmaCollected'];
+
+        $tnpw = $this->conditionRepo->hasCondition($order->order_id, 'TNPW');
+        $tnpp = $this->conditionRepo->hasCondition($order->order_id, 'TNPP');
+        $tnpt = $this->conditionRepo->hasCondition($order->order_id, 'TNPT');
+        $tnpwi = $this->conditionRepo->hasCondition($order->order_id, 'TNPWI');
+
+        if ($tnpw || $tnpp || $tnpt || $tnpwi) {
+            $dateCollected = $reportPayload['DatePlasmaReceived'];
+        }
+
+        $imagePayload = [
+            'imageRepositoryRequest' => [
+                'accessionCode' => $reportPayload['QLSAccessionNumber'],
+                'altAccessionCd' => $reportPayload['labReferenceId'],  // altAccessionCd <-- labReferenceId <-- clientLabRefId
+                'labCd' => $sourceSystemUdid,
+                'patFirstName' => $reportPayload['patientGivenName'],
+                'patLastName' => $reportPayload['patientSurname'],
+                'patMiddleName' => isset($reportPayload['patientInitials']) ? $reportPayload['patientInitials'] : 'no-data',
+                'clientNum' => $reportPayload['ClientID'],
+                'dateOfBirth' => $reportPayload['DateOfBirth'],
+                'dateOfService' => $dateOfService,
+                'dateCollected' => $dateCollected,
+                'reportingId' => $report_id,
+                'imageContent' => [
+                    'imageCode' => null,
+                    'imageSeq' => 1,
+                    'imageCaption' => null,
+                    'contentData' => array_merge($prismOrderAdId, $reportPayload),
+                    'compressInd' => null,
+                    'contentProperty' => [
+                        'classification' => 'MRD',
+                        'category' => 'PRISM',
+                        'width' => null,
+                        'height' => null,
+                        'id' => null,
+                        'creationTimestamp' => $currentTimestamp,
+                        'type' => 'JSON',
+                    ],
+                ],
+            ],
+        ];
+
+        $uri = $this->queueWorkerOrder->getInterfaceEndpoint(self::QDRS_INTERFACE_UDID, self::QDRS_EVENT_UDID);
+        $authorization = $request->getServiceAuthorization(self::QDRS_INTERFACE_UDID);
+
+        $response = $request->callOutboundApiRequest(
+            $uri,
+            [$authorization['headerKey'].': '.$authorization['token']],
+            $imagePayload,
+            $authorization['systemUserApiCredentialId'],
+            false,
+            false,
+            120
+        );
+        if ($response['responseStatusCode'] !== 200) {
+            throw new Exception('Error Sending Report Payload To QDRS Image Repository');
+        }
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Models\Master\SourceSystem;
+use App\Models\Product\ProductDefinitions;
+use App\QWorker\JobModel\Queue\JobModel;
+use App\QWorker\JobModel\Request\Request;
+use App\QWorker\Order\Order as QWorkerOrder;
+use App\Repositories\V4\Order\OrderRepository;
+use Exception;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Database\Eloquent\Casts\Json;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+
+class RequestRootIdJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected OrderRepository $orderRepository;
+
+    protected EventService $eventService;
+
+    protected $sourceSystemId;
+
+    protected $orderId;
+
+    protected $orderAdid;
+
+    const DEFAULT_EVENT_CONTEXT = 'ORDER_ROOT_ID_REQUEST';
+
+    const EVENT_UDID = 'OUT_ORD_REQ_ROOT_ID';
+
+    const INTERFACE_UDID = 'ROOT_ID_SERVICE';
+
+    const ROOT_ID_EVENT_CODE = 'QIINT';
+
+    const MONITORING_TEST = 'T1050';
+
+    const PERSONALIZATION_TEST = 'T1030';
+
+    public function __construct($payload = [])
+    {
+
+        $this->payload = $payload;
+        $this->orderRepository = app(OrderRepository::class);
+        $this->eventService = app(EventService::class);
+    }
+
+    /**
+     * requestRootIdSetJob handler
+     */
+    public function handle(): void
+    {
+        try {
+            $payload = $this->payload;
+            DB::beginTransaction();
+
+            $this->orderId = (int) $this->job->getOrderId();
+
+            $jobId = (int) $this->job->getLogId();
+
+            $inboundApiRequestId = $payload['apiRequestId'];
+            $order = $this->orderRepository->getOrder($this->orderId);
+            if ($order->productDefinition->test_code === self::MONITORING_TEST) {
+                $personalizationProductDefinition = ProductDefinitions::select(['test_structure', 'test_code_xref'])->where('test_code', self::PERSONALIZATION_TEST)->firstOrFail();
+                $this->payload['analyteID'] = Arr::get($personalizationProductDefinition->test_structure, 'properties.items.elements.obx.elements.MRDROOTID.src');
+                $this->payload['rootTestCode'] = $personalizationProductDefinition->test_code_xref;
+            }
+            $this->orderAdid = $order->adid;
+
+            $this->sourceSystemId = $this->orderRepository->getOrderSourceSystemId($this->orderId);
+
+            $sourceSystem = SourceSystem::find($this->sourceSystemId);
+
+            $sourceSystemUdid = $sourceSystem->udid;
+
+            $data = $this->requestRootId();
+            $testCodes = $this->orderRepository->getTestCode($order);
+
+            $event = $this->eventService->storeOrderEvent(
+                $order,
+                self::EVENT_UDID,
+                $sourceSystemUdid,
+                $inboundApiRequestId,
+                $jobId,
+                $data['apiRequestId'],
+                $testCodes
+            );
+
+            if ($data['responseStatusCode'] === 201) {
+                $this->eventService->setConditioCode($order, $event->order_event_id, self::ROOT_ID_EVENT_CODE);
+
+                $this->orderRepository->addCommentsToEvents([
+                    'order_event_id' => $event->order_event_id,
+                    'systemComment' => 'Request Root ID requires Manual Intervention. Internal case ID is '.$data['apiRequestId'],
+                    'systemCommentTime' => Carbon::now(),
+                ]);
+            } else {
+                $responseData = Json::decode($data['response']);
+                $this->orderRepository->storeRootId($this->orderId, $responseData['rootID'], $event->order_event_id);
+
+                $orderJobSpawner = app(OrderJobSpawnerV4::class);
+                $orderJobSpawner->spawn(get_class($this), [
+                    'orderId' => $this->orderId,
+                    'data' => [
+                        'apiRequestId' => $inboundApiRequestId,
+                    ],
+                ]);
+            }
+            DB::commit();
+        } catch (\Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+
+    /**
+     * @throws Exception
+     */
+    protected function requestRootId(): array
+    {
+        $qWorkerOrder = app(QWorkerOrder::class);
+        $uri = $qWorkerOrder->getInterfaceEndpoint(self::INTERFACE_UDID, self::EVENT_UDID);
+
+        $request = app(Request::class);
+
+        $authorization = $request->getServiceAuthorization(self::INTERFACE_UDID);
+
+        $response = $request->callOutboundApiRequest(
+            $uri,
+            [$authorization['headerKey'].': '.$authorization['token']],
+            $this->generateRootIdServiceBody(),
+            $authorization['systemUserApiCredentialId']
+        );
+
+        if ($response['responseStatusCode'] !== 200 && $response['responseStatusCode'] !== 201) {
+            throw new Exception('Error getting Root ID - Response: '.$response['response']);
+        }
+
+        $jobModel = app(JobModel::class);
+
+        $jobId = (int) $this->job->getLogId();
+
+        $jobModel->addOutboundRequests($jobId, [$response['apiRequestId']]);
+
+        return $response;
+    }
+
+    protected function generateRootIdServiceBody(): array
+    {
+        $orderHeader = $this->orderRepository->getOrderHeader($this->orderId);
+
+        $extractOrderAdid = explode('.', $this->orderAdid);
+
+        $sourceSystemUdid = $extractOrderAdid[0];
+
+        return [
+            'options' => [
+                'requestId' => 'prism-queue_job_log_id-'.$this->orderId,
+                'minimumDegreeMatch' => '144',
+                'DOSFrom' => Carbon::now()->subYears(20)->format('Y-m-d'),
+                'DOSTo' => Carbon::now()->format('Y-m-d'),
+                'patientProvidedRootId' => '',
+            ],
+            'accession' => [
+                'orderAdid' => $this->orderAdid,
+                'eid' => '',
+                'rootTestCode' => isset($this->payload['rootTestCode']) ? '%'.$this->payload['rootTestCode'] : '',
+                'analyteID' => (string) isset($this->payload['analyteID']) ? $this->payload['analyteID'] : '',
+                'labSystemCode' => $sourceSystemUdid,
+                'labAccessionCode' => $orderHeader['fields']['placerOrderXrefNumber'],  // placerOrderXrefNumber
+                'caseToCreate' => 'MRD Root ID',
+                'sfidAttribute' => 'Comments',
+            ],
+            'patient' => [
+                'address' => [
+                    'streetAddressLine' => isset($this->payload['address']['streetAddressLine']) ? $this->payload['address']['streetAddressLine'] : '',
+                    'city' => isset($this->payload['address']['city']) ? $this->payload['address']['city'] : '',
+                    'state' => isset($this->payload['address']['state']) ? $this->payload['address']['state'] : '',
+                    'postalCode' => isset($this->payload['address']['postalCode']) ? $this->payload['address']['postalCode'] : '',
+                    'country' => isset($this->payload['address']['country']) ? $this->payload['address']['country'] : '',
+                ],
+                'name' => [
+                    'firstName' => $orderHeader['patient']['patientGivenName'],
+                    'middleName' => '',
+                    'lastName' => $orderHeader['patient']['patientSurname'],
+                ],
+                'dateOfBirth' => Carbon::parse($orderHeader['patient']['patientDOB'])->format('Y-m-d'),
+                'sex' => $orderHeader['patient']['patientSex'],
+            ],
+        ];
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use App\Exceptions\CustomJobException;
+use App\Http\Services\V4\EventService;
+use App\Models\Master\SourceSystem;
+use App\Repositories\V4\Order\OrderRepository;
+use Exception;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+
+class RootIdSetJobV4 extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    protected $payload;
+
+    protected ?int $sourceSystemId = null;
+
+    private OrderRepository $orderRepository;
+
+    private EventService $eventService;
+
+    const EVENT_UDID = 'OUT_ORD_REQ_ROOT_ID';
+
+    const DEFAULT_EVENT_CONTEXT = 'HAYSTACK_ROOT_ID_SET';
+
+    public function __construct($payload = [])
+    {
+        $this->payload = $payload;
+        $this->orderRepository = app(OrderRepository::class);
+        $this->eventService = app(EventService::class);
+    }
+
+    /**
+     * HaystackRootIdSet jobV4 handler
+     */
+    public function handle(): void
+    {
+        try {
+            DB::beginTransaction();
+            $payload = $this->payload;
+            $orderId = isset($this->payload['orderId']) ? (int) $this->payload['orderId'] : (int) $this->job->getOrderId();
+            $inboundApiRequestId = $payload['apiRequestId'];
+
+            $order = $this->orderRepository->getOrder($orderId);
+            if (empty($order)) {
+                throw new Exception("Order with ID {$orderId} not found.");
+            }
+            $this->sourceSystemId = $this->orderRepository->getOrderSourceSystemId($orderId);
+
+            $sourceSystem = SourceSystem::find($this->sourceSystemId);
+            $sourceSystemUdid = $sourceSystem->udid;
+            $jobId = isset($this->payload['job_id']) ? (int) $this->payload['job_id'] : (int) $this->job->getLogId();
+            $testCodes = $this->orderRepository->getTestCode($order);
+            $testCodes = ! empty($testCodes) ? explode(',', $testCodes)[0] : '';
+            $this->eventService->storeOrderEvent($order, self::EVENT_UDID, $sourceSystemUdid, $inboundApiRequestId, $jobId, 0, $testCodes);
+
+            $orderAdid = $order->adid;
+
+            if (! $orderAdid) {
+                throw new Exception("Order Adid not found for Order ID {$orderId}, cannot set Root ID.");
+            }
+
+            $this->orderRepository->storeRootId($orderId, $orderAdid);
+            $orderJobSpawner = app(OrderJobSpawnerV4::class);
+            $orderJobSpawner->spawn(get_class($this), [
+                'orderId' => $orderId,
+                'data' => [
+                    'apiRequestId' => $inboundApiRequestId,
+                ],
+            ]);
+
+            DB::commit();
+        } catch (\Exception $e) {
+            if (DB::transactionLevel()) {
+                DB::rollBack();
+            }
+
+            // Use the CustomJobException
+            $customException = new CustomJobException(
+                $e->getMessage(),
+                $e->getCode(),
+                $e,
+                self::DEFAULT_EVENT_CONTEXT,
+                null
+            );
+            $this->fail($customException);
+        }
+    }
+}
+<?php
+
+namespace App\Jobs;
+
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use App\Jobs\BaseWorkflowJob;
+
+class SendHL7Job extends BaseWorkflowJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    /**
+     * Create a new job instance.
+     */
+    public function __construct(private $payload)
+    {
+        $this->payload = $payload;
+    }
+
+    /**
+     * Execute the job.
+     */
+    public function handle(): void
+    {
+        var_dump("Sending HL7");
+
+        $this->dispatchNextJob($this->payload);
+    }
+}

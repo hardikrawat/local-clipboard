@@ -68,6 +68,102 @@ header h1 {
     100% { opacity: 1; }
 }
 
+/* Clients Panel Styles */
+.clients-panel {
+    background: white;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+    position: relative;
+}
+
+.clients-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+    border-bottom: 1px solid #e2e8f0;
+    padding-bottom: 10px;
+}
+
+.clients-header h3 {
+    color: #4a5568;
+    font-size: 1.1rem;
+}
+
+.btn-close {
+    background: #f56565;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    width: 24px;
+    height: 24px;
+    font-size: 16px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-close:hover {
+    background: #e53e3e;
+}
+
+.clients-list {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.client-item {
+    display: flex;
+    align-items: center;
+    padding: 10px;
+    margin: 5px 0;
+    background: #f7fafc;
+    border-radius: 8px;
+    border-left: 4px solid #667eea;
+}
+
+.client-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-right: 12px;
+    font-size: 14px;
+    color: white;
+}
+
+.client-info {
+    flex: 1;
+}
+
+.client-primary {
+    font-weight: 600;
+    margin-bottom: 2px;
+}
+
+.client-secondary {
+    font-size: 0.8rem;
+    color: #718096;
+}
+
+.client-status {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    font-size: 0.75rem;
+    color: #718096;
+}
+
+.client-connected-time {
+    margin-bottom: 2px;
+}
+
 .input-section {
     background: white;
     border-radius: 12px;
@@ -158,6 +254,17 @@ header h1 {
     transform: translateY(-2px);
 }
 
+.btn-info {
+    background: #4299e1;
+    color: white;
+    padding: 6px 12px;
+    font-size: 0.8rem;
+}
+
+.btn-info:hover {
+    background: #3182ce;
+}
+
 .clipboard-content {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -171,6 +278,15 @@ header h1 {
     
     .file-input {
         flex-direction: column;
+    }
+    
+    .actions {
+        flex-direction: column;
+        gap: 15px;
+    }
+    
+    .connection-status {
+        justify-content: center;
     }
 }
 
@@ -310,4 +426,36 @@ header h1 {
     text-align: center;
     padding: 20px;
     color: #718096;
+}
+.auth-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(255,255,255,0.1);
+    padding: 10px 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    color: white;
+    font-size: 0.9rem;
+}
+
+.auth-status {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.btn-logout {
+    background: rgba(245, 101, 101, 0.8);
+    color: white;
+    border: none;
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.3s ease;
+}
+
+.btn-logout:hover {
+    background: rgba(245, 101, 101, 1);
 }
