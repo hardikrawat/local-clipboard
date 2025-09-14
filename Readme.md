@@ -57,7 +57,7 @@ A powerful, self-hosted clipboard sharing solution that enables seamless text an
 
 ## 🎥 Demo
 
-![Local Clipboard Demo](docs/demo.gif)
+![Local Clipboard Demo](Not Available!)
 
 *Access your clipboard from multiple devices simultaneously with real-time synchronization*
 
@@ -82,7 +82,7 @@ A powerful, self-hosted clipboard sharing solution that enables seamless text an
 
 ```
 # Clone the repository
-git clone https://github.com/yourusername/local-clipboard.git
+git clone https://github.com/hardikrawat/local-clipboard.git
 cd local-clipboard
 
 # Install dependencies
@@ -107,7 +107,7 @@ Access your clipboard at `http://localhost:3000` or `http://YOUR_LOCAL_IP:3000`
 
 1. **Clone the Repository**
    ```
-   git clone https://github.com/yourusername/local-clipboard.git
+   git clone https://github.com/hardikrawat/local-clipboard.git
    cd local-clipboard
    ```
 
@@ -168,7 +168,7 @@ Access your clipboard at `http://localhost:3000` or `http://YOUR_LOCAL_IP:3000`
 Run our automated setup script:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/yourusername/local-clipboard/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hardikrawat/local-clipboard/main/install.sh | bash
 ```
 
 ## ⚙️ Configuration
