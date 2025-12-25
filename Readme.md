@@ -1,8 +1,4 @@
-# Local Clipboard - Professional README
 
-Here's a comprehensive and professional README file for your Local Clipboard project:
-
-```markdown
 # 🔗 Local Clipboard
 
 A powerful, self-hosted clipboard sharing solution that enables seamless text and file sharing across multiple devices on your local network. Built with Node.js, Express, Socket.IO, and MySQL for real-time synchronization and persistent storage.
